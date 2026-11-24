@@ -1,0 +1,11 @@
+# OS / editor
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local download cache (if THEGAP_CACHE points inside the project)
+data/cache/

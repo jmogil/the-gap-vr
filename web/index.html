@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Gap 3D</title>
+  <meta name="description" content="Open-data 3D model of Yuruga Street, The Gap (Brisbane) and its surrounding 500 m: LiDAR terrain, roads and buildings, explorable in a browser or in VR.">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="css/app.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+      "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.8.3/build/index.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="loading" role="status" aria-live="polite">
+    <div class="loading-card">
+      <h1>The Gap <span>3D</span></h1>
+      <p id="loading-text">Loading…</p>
+      <div class="bar"><div id="loading-bar"></div></div>
+    </div>
+  </div>
+
+  <aside id="panel" aria-label="Controls">
+    <header>
+      <div>
+        <h1>The Gap <span>3D</span></h1>
+        <p class="sub">Yuruga Street + 500 m · Brisbane, QLD</p>
+      </div>
+      <button id="panel-toggle" class="icon-btn" aria-label="Collapse panel" title="Collapse panel">–</button>
+    </header>
+
+    <div class="panel-body">
+      <section>
+        <h2>Mode</h2>
+        <div class="seg" role="group" aria-label="View mode">
+          <button id="mode-orbit" class="active">Orbit</button>
+          <button id="mode-walk">Walk</button>
+          <button id="mode-vr" disabled title="WebXR not available in this browser">VR</button>
+        </div>
+        <p class="hint" id="mode-hint"></p>
+      </section>
+
+      <section>
+        <h2>Layers</h2>
+        <label class="chk"><input type="checkbox" id="lyr-buildings" checked> Buildings</label>
+        <label class="chk"><input type="checkbox" id="lyr-roads" checked> Roads &amp; paths</label>
+        <label class="chk"><input type="checkbox" id="lyr-labels" checked> Street names</label>
+        <label class="chk"><input type="checkbox" id="lyr-aerial" checked> Aerial photo on ground</label>
+        <label class="chk"><input type="checkbox" id="lyr-photoroofs"> Photo-textured roofs</label>
+        <label class="chk"><input type="checkbox" id="lyr-heightsrc"> Colour buildings by height source</label>
+        <label class="chk"><input type="checkbox" id="lyr-focus" checked> 500 m study area</label>
+        <label class="chk"><input type="checkbox" id="lyr-shadows" checked> Shadows</label>
+      </section>
+
+      <section>
+        <h2>Sun <span class="val" id="sun-label"></span></h2>
+        <input type="range" id="sun-time" min="300" max="1200" step="5" value="600" aria-label="Time of day">
+        <div class="row">
+          <input type="date" id="sun-date" aria-label="Date">
+          <button id="sun-now" class="small">Now</button>
+        </div>
+      </section>
+
+      <section id="legend-src" hidden>
+        <h2>Height source</h2>
+        <div class="legend"><i style="background:#3fa7d6"></i>OSM levels/height</div>
+        <div class="legend"><i style="background:#f2a541"></i>Microsoft ML estimate</div>
+        <div class="legend"><i style="background:#d64f6a"></i>Default (no data)</div>
+      </section>
+
+      <section class="help">
+        <h2>Controls</h2>
+        <div id="help-orbit">
+          <p><b>Drag</b> rotate · <b>Right-drag</b> pan · <b>Scroll</b> zoom</p>
+          <p><b>Click</b> a building or road for details</p>
+          <p><b>Double-click</b> the ground to walk there</p>
+        </div>
+        <div id="help-walk" hidden>
+          <p><b>W A S D</b> / arrows move · <b>Shift</b> run</p>
+          <p><b>Click</b> to capture mouse · <b>Esc</b> release</p>
+          <p><b>F</b> toggle fly · <b>E</b>/<b>Q</b> up/down when flying</p>
+        </div>
+        <div id="help-vr" hidden>
+          <p><b>Left stick</b> walk · <b>Right stick</b> snap-turn</p>
+          <p><b>Trigger</b> aim &amp; release to teleport</p>
+        </div>
+      </section>
+    </div>
+  </aside>
+
+  <div id="info" hidden>
+    <button id="info-close" class="icon-btn" aria-label="Close">×</button>
+    <div id="info-body"></div>
+  </div>
+
+  <div id="mapbox">
+    <canvas id="minimap" width="440" height="440" aria-label="Overview map; click to jump"></canvas>
+  </div>
+
+  <div id="hud"></div>
+  <div id="crosshair" hidden></div>
+  <div id="walk-overlay" hidden>Click to look around · Esc to release</div>
+
+  <footer id="attrib">
+    Terrain &amp; imagery © State of Queensland (CC BY-SA) · Roads &amp; buildings © OpenStreetMap contributors (ODbL) ·
+    Gap-fill footprints © Microsoft (ODbL) · <a href="#" id="about-link">About the data</a>
+  </footer>
+
+  <dialog id="about">
+    <h2>About this model</h2>
+    <div id="about-body"></div>
+    <form method="dialog"><button>Close</button></form>
+  </dialog>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

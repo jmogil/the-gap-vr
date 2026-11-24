@@ -1,0 +1,11 @@
+# Data pipeline (Python 3.9+). The web viewer itself needs no installs.
+numpy<2.1
+scipy<1.14
+shapely>=2.0,<2.1
+pyproj<3.7
+rasterio<1.5
+pydelatin
+mapbox_earcut
+pillow
+requests
+laspy[lazrs]  # for the upcoming LiDAR point-cloud step

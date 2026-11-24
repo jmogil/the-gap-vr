@@ -1,0 +1,11 @@
+{
+  "bounds_epsg7856": [
+    494011.0,
+    6963941.0,
+    495211.0,
+    6965141.0
+  ],
+  "size_px": 8192,
+  "resolution_m": 0.146484375,
+  "source": "Queensland Government, Brisbane_LGA_2022_10cm_SISP via LatestStateProgram_AllUsers"
+}

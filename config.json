@@ -1,0 +1,27 @@
+{
+  "name": "Yuruga Street, The Gap QLD 4061",
+  "crs": "EPSG:7856",
+  "crs_name": "GDA2020 / MGA zone 56",
+  "anchor": {
+    "description": "Midpoint of Yuruga Street (OSM way 30657925)",
+    "osm_way": 30657925,
+    "easting": 494611,
+    "northing": 6964541
+  },
+  "half_size_m": 600,
+  "focus_buffer_m": 500,
+  "dem": {
+    "service": "https://spatial-img.information.qld.gov.au/arcgis/rest/services/Elevation/QldDem/ImageServer",
+    "resolution_m": 0.5
+  },
+  "imagery": {
+    "service": "https://spatial-img.information.qld.gov.au/arcgis/rest/services/Basemaps/LatestStateProgram_AllUsers/ImageServer",
+    "size_px": 8192
+  },
+  "overpass_endpoints": [
+    "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter"
+  ]
+}

@@ -1,0 +1,700 @@
+// The Gap 3D — open-data model of Yuruga Street, The Gap (Brisbane) and its surrounding 500 m.
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Sky } from 'three/addons/objects/Sky.js';
+import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
+import { TerrainHeights, BuildingIndex, toLonLat, toMGA } from './world.js';
+import { WalkControls } from './walk.js';
+import { XRLocomotion } from './xr.js';
+import { sunPosition, brisbaneDate, brisbaneToday } from './sun.js';
+import { Minimap } from './minimap.js';
+import { makeLabel } from './labels.js';
+
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
+
+const $ = (id) => document.getElementById(id);
+const isMobile = /Android|iPhone|iPad|Quest|OculusBrowser|Pico/i.test(navigator.userAgent);
+const SRC_COLOURS = { 'OSM height tag': '#3fa7d6', 'OSM building:levels': '#3fa7d6', 'Microsoft ML estimate': '#f2a541', 'default (no data)': '#d64f6a' };
+
+function setProgress(f, text) {
+  $('loading-bar').style.width = `${Math.round(f * 100)}%`;
+  if (text) $('loading-text').textContent = text;
+}
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  return r.json();
+}
+async function fetchBuffer(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  return r.arrayBuffer();
+}
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1).replace(/_/g, ' ') : '');
+
+main().catch((err) => {
+  console.error(err);
+  $('loading').classList.add('error');
+  $('loading-text').textContent = `Could not load the model: ${err?.message || err?.target?.src || err}` +
+    (location.protocol === 'file:' ? ' — open it through a local web server (see README).' : '');
+});
+
+async function main() {
+  setProgress(0.03, 'Loading terrain and feature data…');
+  const [meta, features, hmBuf] = await Promise.all([
+    fetchJSON('data/scene.json'), fetchJSON('data/features.json'), fetchBuffer('data/terrain_1m.u16')]);
+  const terrain = new TerrainHeights(meta, hmBuf);
+  const bindex = new BuildingIndex(features.buildings);
+  const H = meta.half_size_m;
+  const lat0 = meta.anchor.lat, lon0 = meta.anchor.lon;
+
+  // ---------------------------------------------------------------- renderer, scene, camera
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.toneMapping = THREE.NeutralToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.xr.enabled = true;
+  renderer.domElement.classList.add('webgl');
+  renderer.domElement.tabIndex = 0;
+  document.body.prepend(renderer.domElement);
+  const maxAniso = renderer.capabilities.getMaxAnisotropy();
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.5, 6000);
+  const rig = new THREE.Group();            // the user's "body" in VR; identity otherwise
+  rig.add(camera);
+  scene.add(rig);
+
+  // ---------------------------------------------------------------- sky, sun, fog
+  const sky = new Sky();
+  sky.scale.setScalar(4500);
+  Object.assign(sky.material.uniforms.turbidity, { value: 4.5 });
+  Object.assign(sky.material.uniforms.rayleigh, { value: 1.1 });
+  Object.assign(sky.material.uniforms.mieCoefficient, { value: 0.004 });
+  Object.assign(sky.material.uniforms.mieDirectionalG, { value: 0.8 });
+  scene.add(sky);
+  const hemi = new THREE.HemisphereLight(0xdde9f6, 0x66704f, 1.15);
+  scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xfff3df, 3.0);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(isMobile ? 2048 : 4096, isMobile ? 2048 : 4096);
+  sun.shadow.bias = -0.0003;
+  sun.shadow.normalBias = 0.05;
+  sun.shadow.camera.near = 10;
+  sun.shadow.camera.far = 2600;
+  scene.add(sun, sun.target);
+  const sunDir = new THREE.Vector3(0, 1, 0);
+  const fogColour = new THREE.Color(0xc9d6e2);
+  scene.fog = new THREE.Fog(fogColour, 1800, 5200);
+
+  // ---------------------------------------------------------------- load model + imagery
+  setProgress(0.1, 'Loading 3D model (terrain, roads, buildings)…');
+  const gltf = await new Promise((resolve, reject) => new GLTFLoader().load('data/scene.glb', resolve,
+    (e) => { if (e.total) setProgress(0.1 + 0.6 * (e.loaded / e.total)); }, reject));
+  setProgress(0.72, 'Loading 2022 aerial imagery…');
+  const loadOrtho = async (url) => {
+    const t = await new THREE.TextureLoader().loadAsync(url);
+    t.flipY = false;                               // glTF-style UVs (v down)
+    t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = maxAniso;
+    t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+    return t;
+  };
+  let ortho = await loadOrtho('data/' + meta.imagery.files['4096']);
+
+  const meshes = {};
+  gltf.scene.traverse((o) => { if (o.isMesh) meshes[o.name] = o; });
+  const terrainMesh = meshes.terrain, roads = meshes.roads, walls = meshes.building_walls, roofs = meshes.building_roofs;
+  scene.add(gltf.scene);
+
+  const mats = {
+    terrainPhoto: new THREE.MeshStandardMaterial({ map: ortho, roughness: 1, metalness: 0 }),
+    terrainPlain: new THREE.MeshStandardMaterial({ color: 0xa9b894, roughness: 1, metalness: 0 }),
+    roads: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, metalness: 0,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 }),
+    walls: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0 }),
+    roofs: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.72, metalness: 0, side: THREE.DoubleSide }),
+    roofsPhoto: new THREE.MeshStandardMaterial({ map: ortho, roughness: 0.8, metalness: 0, side: THREE.DoubleSide }),
+    highlight: new THREE.MeshBasicMaterial({ color: 0x3fa7d6, transparent: true, opacity: 0.5, side: THREE.DoubleSide,
+      polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -8, depthWrite: false }),
+  };
+  terrainMesh.material = mats.terrainPhoto;
+  roads.material = mats.roads;
+  walls.material = mats.walls;
+  roofs.material = mats.roofs;
+  terrainMesh.receiveShadow = true;
+  roads.receiveShadow = true;
+  walls.castShadow = walls.receiveShadow = true;
+  roofs.castShadow = roofs.receiveShadow = true;
+  roads.renderOrder = 1;
+
+  // Feature index ranges (contiguous per feature) — taken before the BVH reorders indices.
+  const ranges = new Map();
+  for (const m of [walls, roofs, roads]) {
+    const idx = m.geometry.index.array.slice();
+    const fid = m.geometry.attributes._feature_id.array;
+    const r = new Map();
+    for (let t = 0; t < idx.length; t += 3) {
+      const f = fid[idx[t]];
+      const e = r.get(f);
+      if (e) e[1] = t + 3; else r.set(f, [t, t + 3]);
+    }
+    ranges.set(m, { idx, r });
+  }
+  setProgress(0.82, 'Indexing geometry for picking…');
+  await new Promise((r) => setTimeout(r, 0));
+  for (const m of [terrainMesh, roads, walls, roofs]) m.geometry.computeBoundsTree();
+
+  // Diorama skirt around the edge of the terrain.
+  scene.add(makeSkirt(terrain, H));
+
+  // ---------------------------------------------------------------- study area + Yuruga St
+  const focus = new THREE.Group();
+  const outlinePts = meta.focus_outline.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
+  const outline = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(outlinePts),
+    new THREE.LineDashedMaterial({ color: 0xf2a541, dashSize: 8, gapSize: 6, transparent: true, opacity: 0.95 }));
+  outline.computeLineDistances();
+  focus.add(outline);
+  const ribbon = makeStreetRibbon(meta.focus_street, terrain);   // overview only
+  focus.add(ribbon);
+  scene.add(focus);
+
+  // ---------------------------------------------------------------- street labels
+  const labels = new THREE.Group();
+  for (const l of features.labels) {
+    const s = makeLabel(l.text, l.text === 'Yuruga Street');
+    s.position.set(l.x, l.y + 6, l.z);
+    s.userData.priority = l.text === 'Yuruga Street' ? 0 : 1;
+    labels.add(s);
+  }
+  if (!features.labels.some((l) => l.text === 'Yuruga Street')) {
+    const s = makeLabel('Yuruga Street', true);
+    s.position.set(0, terrain.heightAt(0, 0) + 6, 0);
+    s.userData.priority = 0;
+    labels.add(s);
+  }
+  scene.add(labels);
+
+  // Screen-space decluttering: keep the closest labels, hide ones that would overlap.
+  const lv = new THREE.Vector3();
+  function declutterLabels() {
+    if (!labels.visible) return;
+    const w = window.innerWidth, h = window.innerHeight, k = camera.projectionMatrix.elements[5] / 2 * h;
+    const items = labels.children.map((s) => ({ s, d: s.position.distanceToSquared(camera.position) }));
+    items.sort((a, b) => a.s.userData.priority - b.s.userData.priority || a.d - b.d);
+    const boxes = [];
+    for (const { s, d } of items) {
+      lv.copy(s.position).project(camera);
+      if (lv.z > 1 || Math.abs(lv.x) > 1.05 || Math.abs(lv.y) > 1.05 || d > 900 * 900) { s.visible = false; continue; }
+      const sx = ((lv.x + 1) / 2) * w, sy = ((1 - lv.y) / 2) * h;
+      const bw = s.scale.x * k, bh = s.scale.y * k, pad = 6;
+      const box = [sx - bw / 2 - pad, sy - bh - pad, sx + bw / 2 + pad, sy + pad];
+      const clash = boxes.some((b) => box[0] < b[2] && box[2] > b[0] && box[1] < b[3] && box[3] > b[1]);
+      s.visible = !clash;
+      if (!clash) boxes.push(box);
+    }
+  }
+
+  // ---------------------------------------------------------------- controls
+  const orbit = new OrbitControls(camera, renderer.domElement);
+  orbit.enableDamping = true;
+  orbit.dampingFactor = 0.08;
+  orbit.screenSpacePanning = false;
+  orbit.maxPolarAngle = THREE.MathUtils.degToRad(84);
+  orbit.minDistance = 15;
+  orbit.maxDistance = 2600;
+  const h0 = terrain.heightAt(0, 0);
+  orbit.target.set(0, h0, 0);
+  camera.position.set(330, h0 + 560, -620);        // from the north-east, sun behind the viewer
+  orbit.update();
+
+  const walk = new WalkControls(camera, renderer.domElement, terrain, bindex);
+  const xr = new XRLocomotion({ renderer, scene, rig, camera, terrain, buildings: bindex });
+
+  const st = meta.focus_street;
+  const sdx = st[st.length - 1][0] - st[0][0], sdz = st[st.length - 1][1] - st[0][1];
+  const startYaw = Math.atan2(-sdx, -sdz);          // look along Yuruga Street
+
+  const app = { mode: 'orbit', selected: null, highlight: null, shadowHalf: 0 };
+  const minimap = new Minimap($('minimap'), meta, 'data/' + meta.imagery.files['1024'], (x, z) => jumpTo(x, z));
+
+  // ---------------------------------------------------------------- sun
+  const today = brisbaneToday();
+  $('sun-date').value = today.iso;
+  $('sun-time').value = 600; // 10:00
+  function updateSun() {
+    const minutes = Number($('sun-time').value);
+    const date = brisbaneDate($('sun-date').value || today.iso, minutes);
+    const { azimuth, elevation } = sunPosition(date, lat0, lon0);
+    sunDir.set(Math.sin(azimuth) * Math.cos(elevation), Math.sin(elevation), -Math.cos(azimuth) * Math.cos(elevation));
+    sky.material.uniforms.sunPosition.value.copy(sunDir);
+    const day = THREE.MathUtils.smoothstep(elevation, -0.05, 0.25);
+    sun.intensity = 4.2 * THREE.MathUtils.smoothstep(elevation, -0.01, 0.12);
+    sun.color.setHSL(0.1, 0.6 * (1 - day) + 0.25, 0.92 - 0.1 * (1 - day));
+    hemi.intensity = 0.2 + 0.6 * day;
+    fogColour.setRGB(0.24 + 0.55 * day, 0.27 + 0.57 * day, 0.33 + 0.56 * day);
+    scene.fog.color.copy(fogColour);
+    renderer.toneMappingExposure = 0.8 + 0.25 * day;
+    const hh = Math.floor(minutes / 60), mm = minutes % 60;
+    $('sun-label').textContent = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')} AEST · ` +
+      `alt ${Math.round(THREE.MathUtils.radToDeg(elevation))}°`;
+  }
+  $('sun-time').addEventListener('input', updateSun);
+  $('sun-date').addEventListener('change', updateSun);
+  $('sun-now').addEventListener('click', () => {
+    const t = brisbaneToday();
+    $('sun-date').value = t.iso;
+    $('sun-time').value = Math.min(1200, Math.max(300, t.minutes));
+    updateSun();
+  });
+  updateSun();
+
+  // ---------------------------------------------------------------- modes
+  function freeSpot(x, z) {
+    if (bindex.hit(x, z) < 0) return [x, z];
+    for (let r = 1; r < 40; r += 1) for (let a = 0; a < 16; a++) {
+      const px = x + r * Math.cos((a / 16) * Math.PI * 2), pz = z + r * Math.sin((a / 16) * Math.PI * 2);
+      if (terrain.contains(px, pz, 2) && bindex.hit(px, pz) < 0) return [px, pz];
+    }
+    return [x, z];
+  }
+
+  function setMode(mode, opts = {}) {
+    if (renderer.xr.isPresenting && mode !== 'vr') return;
+    const prev = app.mode;
+    if (prev === 'walk' && mode !== 'walk') walk.disable();
+    app.mode = mode;
+    if (mode === 'orbit') {
+      orbit.enabled = true;
+      camera.fov = 50;
+      if (prev === 'walk') {
+        const p = walk.pos;
+        orbit.target.set(p.x, p.y, p.z);
+        const back = new THREE.Vector3(Math.sin(walk.yaw), 0, Math.cos(walk.yaw)).multiplyScalar(140);
+        camera.position.set(p.x + back.x, p.y + 110, p.z + back.z);
+      }
+      scene.fog.near = 1800; scene.fog.far = 5200;
+    } else if (mode === 'walk') {
+      orbit.enabled = false;
+      camera.fov = 70;
+      camera.near = 0.1;
+      let x = opts.x ?? orbit.target.x, z = opts.z ?? orbit.target.z;
+      let yaw = opts.yaw;
+      if (opts.x === undefined && prev === 'orbit' && Math.hypot(orbit.target.x, orbit.target.z) < 1) {
+        x = 0; z = 0; yaw = startYaw;      // first walk: stand on Yuruga Street
+      }
+      if (yaw === undefined) {
+        const d = new THREE.Vector3().subVectors(orbit.target, camera.position);
+        yaw = Math.atan2(-d.x, -d.z);
+      }
+      [x, z] = freeSpot(x, z);
+      walk.enable(x, z, yaw);
+      scene.fog.near = 220; scene.fog.far = 1300;
+    }
+    camera.updateProjectionMatrix();
+    syncModeUI();
+  }
+
+  function syncModeUI() {
+    const m = app.mode;
+    $('mode-orbit').classList.toggle('active', m === 'orbit');
+    $('mode-walk').classList.toggle('active', m === 'walk');
+    $('mode-vr').classList.toggle('active', m === 'vr');
+    $('help-orbit').hidden = m !== 'orbit';
+    $('help-walk').hidden = m !== 'walk';
+    $('help-vr').hidden = m !== 'vr';
+    $('crosshair').hidden = !(m === 'walk' && walk.locked);
+    $('walk-overlay').hidden = !(m === 'walk' && !walk.locked);
+    $('mode-hint').textContent = m === 'walk'
+      ? (walk.fly ? 'Flying — E/Q to rise/sink, F to land.' : 'Walking at street level (eye height 1.65 m).')
+      : m === 'vr' ? 'In VR — take off the headset to return.' : 'Overview of the study area.';
+    labels.visible = $('lyr-labels').checked && m !== 'vr';
+    ribbon.visible = m === 'orbit';
+  }
+  walk.onChange = syncModeUI;
+
+  function jumpTo(x, z) {
+    if (app.mode === 'walk') {
+      const [fx, fz] = freeSpot(x, z);
+      walk.enable(fx, fz, walk.yaw);
+    } else if (app.mode === 'orbit') {
+      const off = new THREE.Vector3().subVectors(camera.position, orbit.target);
+      orbit.target.set(x, terrain.heightAt(x, z), z);
+      camera.position.copy(orbit.target).add(off);
+    }
+  }
+
+  $('mode-orbit').addEventListener('click', () => setMode('orbit'));
+  $('mode-walk').addEventListener('click', () => setMode('walk'));
+  renderer.domElement.addEventListener('click', () => { if (app.mode === 'walk' && !walk.locked) walk.lock(); });
+  renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+  renderer.domElement.addEventListener('dblclick', (e) => {
+    if (app.mode !== 'orbit') return;
+    const hit = pickAt(e.clientX, e.clientY, true);
+    if (!hit) return;
+    const d = new THREE.Vector3().subVectors(hit.point, camera.position);
+    setMode('walk', { x: hit.point.x, z: hit.point.z, yaw: Math.atan2(-d.x, -d.z) });
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.target.closest?.('input, textarea, select')) return;
+    if (e.code === 'Digit1') setMode('orbit');
+    if (e.code === 'Digit2') setMode('walk');
+  });
+
+  // ---------------------------------------------------------------- VR
+  if (navigator.xr) {
+    navigator.xr.isSessionSupported('immersive-vr').then((ok) => {
+      if (!ok) return;
+      $('mode-vr').disabled = false;
+      $('mode-vr').title = 'Enter VR (e.g. Meta Quest)';
+    }).catch(() => {});
+  }
+  let xrSession = null;
+  $('mode-vr').addEventListener('click', async () => {
+    if (xrSession) { xrSession.end(); return; }
+    try {
+      const session = await navigator.xr.requestSession('immersive-vr',
+        { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] });
+      renderer.xr.setReferenceSpaceType('local-floor');
+      await renderer.xr.setSession(session);
+      xrSession = session;
+      session.addEventListener('end', () => { xrSession = null; });
+    } catch (err) {
+      console.error(err);
+      $('mode-hint').textContent = `Could not start VR: ${err.message}`;
+    }
+  });
+  renderer.xr.addEventListener('sessionstart', () => {
+    let x, z, yaw;
+    if (app.mode === 'walk') {
+      x = walk.pos.x; z = walk.pos.z; yaw = walk.yaw;
+    } else {
+      [x, z] = freeSpot(0, 0); yaw = startYaw;
+    }
+    walk.disable();
+    orbit.enabled = false;
+    camera.position.set(0, 0, 0);
+    camera.rotation.set(0, 0, 0);
+    xr.start(x, z, yaw);
+    app.mode = 'vr';
+    scene.fog.near = 220; scene.fog.far = 1300;
+    syncModeUI();
+  });
+  renderer.xr.addEventListener('sessionend', () => {
+    const head = xr.getHead().clone();
+    const dir = camera.getWorldDirection(new THREE.Vector3());
+    rig.position.set(0, 0, 0);
+    rig.rotation.set(0, 0, 0);
+    app.mode = 'vr-exit';
+    setMode('walk', { x: head.x, z: head.z, yaw: Math.atan2(-dir.x, -dir.z) });
+  });
+
+  // ---------------------------------------------------------------- layers
+  const lyr = (id, fn) => { $(id).addEventListener('change', (e) => fn(e.target.checked)); fn($(id).checked); };
+  lyr('lyr-buildings', (on) => { walls.visible = roofs.visible = on; clearSelection(); });
+  lyr('lyr-roads', (on) => { roads.visible = on; });
+  lyr('lyr-labels', () => syncModeUI());
+  lyr('lyr-aerial', (on) => { terrainMesh.material = on ? mats.terrainPhoto : mats.terrainPlain; });
+  lyr('lyr-photoroofs', (on) => { roofs.material = on ? mats.roofsPhoto : mats.roofs; });
+  lyr('lyr-focus', (on) => { focus.visible = on; });
+  lyr('lyr-shadows', (on) => { sun.castShadow = on; });
+  const colourStore = new Map();
+  lyr('lyr-heightsrc', (on) => {
+    $('legend-src').hidden = !on;
+    for (const m of [walls, roofs]) {
+      const col = m.geometry.attributes.color;
+      if (!colourStore.has(m)) colourStore.set(m, col.array.slice());
+      if (!on) { col.array.set(colourStore.get(m)); col.needsUpdate = true; continue; }
+      const fid = m.geometry.attributes._feature_id.array;
+      const c = new THREE.Color();
+      for (let i = 0; i < fid.length; i++) {
+        const b = features.buildings[fid[i]];
+        c.set(SRC_COLOURS[b.height_source] || '#888888');
+        col.array[i * 3] = c.r; col.array[i * 3 + 1] = c.g; col.array[i * 3 + 2] = c.b;
+      }
+      col.needsUpdate = true;
+    }
+  });
+  $('panel-toggle').addEventListener('click', () => {
+    const p = $('panel');
+    p.classList.toggle('collapsed');
+    $('panel-toggle').textContent = p.classList.contains('collapsed') ? '+' : '–';
+  });
+
+  // ---------------------------------------------------------------- picking + info
+  const raycaster = new THREE.Raycaster();
+  raycaster.firstHitOnly = true;
+  const ndc = new THREE.Vector2();
+  function pickAt(cx, cy, groundOnly = false) {
+    if (cx === null) ndc.set(0, 0);
+    else ndc.set((cx / window.innerWidth) * 2 - 1, -(cy / window.innerHeight) * 2 + 1);
+    raycaster.setFromCamera(ndc, camera);
+    const targets = groundOnly ? [terrainMesh, roads] : [roofs, walls, roads, terrainMesh];
+    const hits = raycaster.intersectObjects(targets.filter((m) => m.visible), false);
+    return hits[0] || null;
+  }
+
+  function clearSelection() {
+    if (app.highlight) { scene.remove(app.highlight); app.highlight.traverse((o) => o.geometry?.dispose()); }
+    app.highlight = null;
+    app.selected = null;
+    $('info').hidden = true;
+  }
+
+  function highlightFeature(meshList, fid) {
+    const g = new THREE.Group();
+    for (const m of meshList) {
+      const rr = ranges.get(m);
+      const span = rr.r.get(fid);
+      if (!span) continue;
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', m.geometry.attributes.position);
+      geo.setIndex(new THREE.BufferAttribute(rr.idx.slice(span[0], span[1]), 1));
+      const hm = new THREE.Mesh(geo, mats.highlight);
+      hm.renderOrder = 5;
+      g.add(hm);
+    }
+    scene.add(g);
+    return g;
+  }
+
+  function select(hit) {
+    clearSelection();
+    if (!hit || hit.object === terrainMesh) return;
+    const fid = hit.object.geometry.attributes._feature_id.getX(hit.face.a);
+    if (hit.object === roads) {
+      app.highlight = highlightFeature([roads], fid);
+      showRoad(features.roads[fid]);
+    } else {
+      app.highlight = highlightFeature([walls, roofs], fid);
+      showBuilding(features.buildings[fid]);
+    }
+  }
+
+  function osmLink(id) {
+    if (!id) return '';
+    const [t, n] = id.split('/');
+    return `<a href="https://www.openstreetmap.org/${t}/${n}" target="_blank" rel="noopener">OSM ${t} ${n}</a>`;
+  }
+
+  function showBuilding(b) {
+    const title = b.addresses?.[0] || b.name || cap(b.type === 'yes' ? 'building' : b.type);
+    const extra = b.addresses?.length > 1 ? `<dt>Also</dt><dd>${b.addresses.slice(1).map(esc).join('<br>')}</dd>` : '';
+    const estimated = b.height_source !== 'OSM height tag' && b.height_source !== 'OSM building:levels';
+    $('info-body').innerHTML = `
+      <div class="kind">Building · ${esc(b.source)}</div>
+      <h3>${esc(title)}</h3>
+      <dl>
+        ${extra}
+        <dt>Type</dt><dd>${esc(cap(b.type))}${b.name && b.name !== title ? ` · ${esc(b.name)}` : ''}</dd>
+        <dt>Height</dt><dd>${b.height_m.toFixed(1)} m to top · eave ${b.eave_m.toFixed(1)} m</dd>
+        <dt>Height from</dt><dd><span class="swatch" style="background:${SRC_COLOURS[b.height_source]}"></span>${esc(b.height_source)}</dd>
+        ${b.levels ? `<dt>Levels</dt><dd>${b.levels}</dd>` : ''}
+        <dt>Roof</dt><dd>${b.roof_colour ? `<span class="swatch" style="background:${b.roof_colour}"></span>` : ''}${b.roof}${b.roof_colour ? ', colour from 2022 aerial' : ''}</dd>
+        <dt>Footprint</dt><dd>${b.footprint_m2.toFixed(0)} m²</dd>
+        <dt>Ground</dt><dd>${b.ground_ahd.toFixed(1)} m AHD</dd>
+        <dt>Outline</dt><dd>${b.osm_id ? osmLink(b.osm_id) : 'Microsoft ML footprint (2026 release)'}</dd>
+      </dl>
+      ${estimated ? '<p class="note">Heights are approximate until LiDAR point clouds are added. Roof shape is a modelled hip roof.</p>' : ''}`;
+    $('info').hidden = false;
+  }
+
+  function showRoad(r) {
+    $('info-body').innerHTML = `
+      <div class="kind">${r.bridge ? 'Bridge' : r.group === 'path' ? 'Path' : 'Road'} · OpenStreetMap</div>
+      <h3>${esc(r.name || cap(r.highway))}</h3>
+      <dl>
+        <dt>Class</dt><dd>${esc(cap(r.highway))}${r.ref ? ` (${esc(r.ref)})` : ''}</dd>
+        <dt>Width</dt><dd>${r.width_m} m <span style="color:var(--text-dim)">(${esc(r.width_source)})</span></dd>
+        ${r.surface ? `<dt>Surface</dt><dd>${esc(cap(r.surface))}</dd>` : ''}
+        ${r.lanes ? `<dt>Lanes</dt><dd>${esc(r.lanes)}</dd>` : ''}
+        ${r.maxspeed ? `<dt>Speed limit</dt><dd>${esc(r.maxspeed)} km/h</dd>` : ''}
+        ${r.oneway ? `<dt>One-way</dt><dd>${esc(r.oneway)}</dd>` : ''}
+        ${r.sidewalk ? `<dt>Footpath</dt><dd>${esc(r.sidewalk)}</dd>` : ''}
+        <dt>Length</dt><dd>${r.length_m} m in model</dd>
+        <dt>Source</dt><dd>${osmLink(r.osm_id)}</dd>
+      </dl>`;
+    $('info').hidden = false;
+  }
+  $('info-close').addEventListener('click', clearSelection);
+
+  let down = null;
+  renderer.domElement.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY, t: performance.now() }; });
+  renderer.domElement.addEventListener('pointerup', (e) => {
+    if (!down || e.button !== 0) return;
+    const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+    if (moved < 5 && performance.now() - down.t < 500) {
+      if (app.mode === 'orbit') select(pickAt(e.clientX, e.clientY));
+      else if (app.mode === 'walk' && walk.locked) select(pickAt(null, null));
+    }
+    down = null;
+  });
+  let hoverQueued = false;
+  renderer.domElement.addEventListener('pointermove', (e) => {
+    if (app.mode !== 'orbit' || hoverQueued || e.buttons) return;
+    hoverQueued = true;
+    requestAnimationFrame(() => {
+      hoverQueued = false;
+      const h = pickAt(e.clientX, e.clientY);
+      renderer.domElement.style.cursor = h && h.object !== terrainMesh ? 'pointer' : 'default';
+    });
+  });
+
+  // ---------------------------------------------------------------- about dialog
+  $('about-body').innerHTML = `
+    <p>${esc(meta.title)} — a ${2 * H / 1000} km × ${2 * H / 1000} km open-data model centred on Yuruga Street
+    (${meta.anchor.lat.toFixed(5)}°, ${meta.anchor.lon.toFixed(5)}°; ${esc(meta.crs_name)}). The dashed outline
+    marks everything within ${meta.focus_buffer_m} m of the street.</p>
+    <table><tr><th>Layer</th><th>Source</th><th>Licence</th></tr>
+    ${meta.sources.map((s) => `<tr><td>${esc(s.layer)}</td><td>${esc(s.name)}<br><small>${esc(s.credit)}</small></td><td>${esc(s.licence)}</td></tr>`).join('')}
+    </table>
+    <p><b>${meta.counts.buildings}</b> buildings · <b>${meta.counts.roads}</b> road/path segments ·
+    <b>${meta.counts.terrain_triangles.toLocaleString()}</b> terrain triangles. Built ${esc(meta.built)}.</p>
+    <p>Accuracy notes: terrain is surveyed LiDAR (bare earth, ~0.1 m vertical). Building outlines are OSM where
+    mapped, otherwise machine-learned. Building heights are estimates (Microsoft ML or defaults) and roofs are modelled
+    hips — colour each building by height source to see which is which. Road widths are typical values unless tagged.</p>`;
+  $('about-link').addEventListener('click', (e) => { e.preventDefault(); $('about').showModal(); });
+
+  // ---------------------------------------------------------------- resize, loop
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  const clock = new THREE.Clock();
+  let hudT = 0;
+  const v3 = new THREE.Vector3();
+  function updateShadowCamera(cx, cy, cz, half) {
+    const sc = sun.shadow.camera;
+    if (Math.abs(half - app.shadowHalf) > 1) {
+      sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half;
+      sc.updateProjectionMatrix();
+      app.shadowHalf = half;
+    }
+    // snap to shadow texels to reduce shimmering while moving
+    const texel = (2 * half) / sun.shadow.mapSize.x;
+    cx = Math.round(cx / texel) * texel; cz = Math.round(cz / texel) * texel;
+    sun.target.position.set(cx, cy, cz);
+    sun.position.set(cx + sunDir.x * 1200, cy + sunDir.y * 1200, cz + sunDir.z * 1200);
+  }
+
+  renderer.setAnimationLoop(() => {
+    const dt = Math.min(clock.getDelta(), 0.1);
+    let px, pz, yaw;
+    if (renderer.xr.isPresenting) {
+      xr.update(dt);
+      const head = xr.getHead();
+      px = head.x; pz = head.z;
+      const d = camera.getWorldDirection(v3);
+      yaw = Math.atan2(-d.x, -d.z);
+      updateShadowCamera(px, head.y, pz, 150);
+    } else if (app.mode === 'walk') {
+      walk.update(dt);
+      px = walk.pos.x; pz = walk.pos.z; yaw = walk.yaw;
+      updateShadowCamera(px, walk.pos.y, pz, 150);
+    } else {
+      orbit.update();
+      const t = orbit.target;
+      const cx = THREE.MathUtils.clamp(t.x, -H, H), cz = THREE.MathUtils.clamp(t.z, -H, H);
+      if (cx !== t.x || cz !== t.z) { camera.position.x += cx - t.x; camera.position.z += cz - t.z; t.x = cx; t.z = cz; }
+      const dy = (terrain.heightAt(t.x, t.z) - t.y) * 0.15;
+      t.y += dy; camera.position.y += dy;
+      const floor = terrain.heightAt(camera.position.x, camera.position.z) + 3;
+      if (camera.position.y < floor) camera.position.y = floor;
+      const dist = camera.position.distanceTo(t);
+      const near = THREE.MathUtils.clamp(dist * 0.004, 0.3, 4);
+      if (Math.abs(near - camera.near) / camera.near > 0.2) { camera.near = near; camera.updateProjectionMatrix(); }
+      px = t.x; pz = t.z;
+      const d = camera.getWorldDirection(v3);
+      yaw = Math.atan2(-d.x, -d.z);
+      updateShadowCamera(t.x, t.y, t.z, THREE.MathUtils.clamp(dist * 0.85, 160, 720));
+    }
+    renderer.render(scene, camera);
+
+    hudT += dt;
+    if (hudT > 0.12) {
+      hudT = 0;
+      const [E, N] = toMGA(meta, px, pz);
+      const [lon, lat] = toLonLat(meta, px, pz);
+      const ahd = terrain.heightAt(px, pz) + meta.base_z_ahd;
+      const hdg = ((-THREE.MathUtils.radToDeg(yaw) % 360) + 360) % 360;
+      $('hud').textContent = `${app.mode === 'orbit' ? 'Target' : 'You'} · E ${E.toFixed(1)} N ${N.toFixed(1)} (MGA56) · ` +
+        `${Math.abs(lat).toFixed(5)}°S ${lon.toFixed(5)}°E · ground ${ahd.toFixed(1)} m AHD · heading ${hdg.toFixed(0)}°`;
+      minimap.draw({ x: px, z: pz, yaw, fov: THREE.MathUtils.degToRad(camera.fov * camera.aspect), mode: app.mode });
+      declutterLabels();
+    }
+  });
+
+  syncModeUI();
+  setProgress(1, 'Ready');
+  $('loading').classList.add('done');
+
+  // Sharper ground imagery on desktop GPUs.
+  if (!isMobile && renderer.capabilities.maxTextureSize >= 8192) {
+    loadOrtho('data/' + meta.imagery.files['8192']).then((t) => {
+      mats.terrainPhoto.map = t; mats.roofsPhoto.map = t;
+      mats.terrainPhoto.needsUpdate = mats.roofsPhoto.needsUpdate = true;
+      ortho.dispose();
+      ortho = t;
+    }).catch((e) => console.warn('8k imagery not loaded', e));
+  }
+
+  // Expose for debugging / research scripting in the console.
+  window.theGap = { THREE, scene, camera, renderer, meta, features, terrain, bindex, setMode, jumpTo, walk, xr, orbit };
+}
+
+function makeSkirt(terrain, H) {
+  const pos = [], idx = [];
+  const bottom = terrain.offset - 15;
+  const sides = [
+    (t) => [-H + 2 * H * t, -H], (t) => [H, -H + 2 * H * t], (t) => [H - 2 * H * t, H], (t) => [-H, H - 2 * H * t]];
+  const steps = 300;
+  for (const f of sides) {
+    const start = pos.length / 3;
+    for (let i = 0; i <= steps; i++) {
+      const [x, z] = f(i / steps);
+      pos.push(x, terrain.heightAt(x, z), z, x, bottom, z);
+    }
+    for (let i = 0; i < steps; i++) {
+      const a = start + i * 2;
+      idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0x6f5f4d, roughness: 1, side: THREE.DoubleSide }));
+}
+
+function makeStreetRibbon(street, terrain) {
+  // Thin amber band down the centre of Yuruga Street.
+  const pts = [];
+  for (let i = 0; i < street.length - 1; i++) {
+    const [ax, az] = street[i], [bx, bz] = street[i + 1];
+    const L = Math.hypot(bx - ax, bz - az), n = Math.max(1, Math.ceil(L));
+    for (let k = 0; k < n; k++) pts.push([ax + ((bx - ax) * k) / n, az + ((bz - az) * k) / n]);
+  }
+  pts.push(street[street.length - 1]);
+  const pos = [], idx = [], w = 0.6;
+  pts.forEach(([x, z], i) => {
+    const [x2, z2] = pts[Math.min(i + 1, pts.length - 1)], [x1, z1] = pts[Math.max(i - 1, 0)];
+    let dx = x2 - x1, dz = z2 - z1; const L = Math.hypot(dx, dz) || 1; dx /= L; dz /= L;
+    const nx = -dz * w, nz = dx * w;
+    pos.push(x + nx, terrain.heightAt(x + nx, z + nz) + 0.08, z + nz, x - nx, terrain.heightAt(x - nx, z - nz) + 0.08, z - nz);
+    if (i < pts.length - 1) { const a = i * 2; idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3); }
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  return new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xf2a541, transparent: true, opacity: 0.85,
+    side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -10, depthWrite: false }));
+}
