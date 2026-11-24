@@ -89,7 +89,7 @@ class Mesh:
 
 
 def build(terrain, H):
-    local = Local()
+    local = Local.osm()
     osm = json.loads((RAW / "osm" / "osm.json").read_text())
     square = shapely.box(-H, -H, H, H)
     ways, circles = [], []

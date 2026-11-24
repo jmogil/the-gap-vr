@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { Sky } from 'three/addons/objects/Sky.js';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
 import { TerrainHeights, BuildingIndex, toLonLat, toMGA } from './world.js';
 import { WalkControls } from './walk.js';
@@ -17,7 +18,8 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const $ = (id) => document.getElementById(id);
 const isMobile = /Android|iPhone|iPad|Quest|OculusBrowser|Pico/i.test(navigator.userAgent);
-const SRC_COLOURS = { 'OSM height tag': '#3fa7d6', 'OSM building:levels': '#3fa7d6', 'Microsoft ML estimate': '#f2a541', 'default (no data)': '#d64f6a' };
+const SRC_COLOURS = { 'LiDAR 2019 (measured)': '#4caf7d', 'OSM height tag': '#3fa7d6', 'OSM building:levels': '#3fa7d6',
+  'Microsoft ML estimate': '#f2a541', 'default (no data)': '#d64f6a' };
 
 function setProgress(f, text) {
   $('loading-bar').style.width = `${Math.round(f * 100)}%`;
@@ -192,7 +194,8 @@ async function main() {
     const boxes = [];
     for (const { s, d } of items) {
       lv.copy(s.position).project(camera);
-      if (lv.z > 1 || Math.abs(lv.x) > 1.05 || Math.abs(lv.y) > 1.05 || d > 900 * 900) { s.visible = false; continue; }
+      const maxD = app.mode === 'orbit' ? 900 : 260;          // street level: nearby streets only
+      if (lv.z > 1 || Math.abs(lv.x) > 1.05 || Math.abs(lv.y) > 1.05 || d > maxD * maxD) { s.visible = false; continue; }
       const sx = ((lv.x + 1) / 2) * w, sy = ((1 - lv.y) / 2) * h;
       const bw = s.scale.x * k, bh = s.scale.y * k, pad = 6;
       const box = [sx - bw / 2 - pad, sy - bh - pad, sx + bw / 2 + pad, sy + pad];
@@ -201,6 +204,11 @@ async function main() {
       if (!clash) boxes.push(box);
     }
   }
+
+  // ---------------------------------------------------------------- trees (2019 LiDAR canopy)
+  const treeData = await fetchJSON('data/trees.json').catch(() => null);
+  const trees = treeData && treeData.trees.length ? makeTrees(treeData.trees, isMobile) : null;
+  if (trees) scene.add(trees.group);
 
   // ---------------------------------------------------------------- controls
   const orbit = new OrbitControls(camera, renderer.domElement);
@@ -405,6 +413,8 @@ async function main() {
   lyr('lyr-photoroofs', (on) => { roofs.material = on ? mats.roofsPhoto : mats.roofs; });
   lyr('lyr-focus', (on) => { focus.visible = on; });
   lyr('lyr-shadows', (on) => { sun.castShadow = on; });
+  lyr('lyr-trees', (on) => { if (trees) trees.group.visible = on; });
+  if (!trees) $('lyr-trees').closest('label').hidden = true;
   const colourStore = new Map();
   lyr('lyr-heightsrc', (on) => {
     $('legend-src').hidden = !on;
@@ -432,11 +442,12 @@ async function main() {
   const raycaster = new THREE.Raycaster();
   raycaster.firstHitOnly = true;
   const ndc = new THREE.Vector2();
-  function pickAt(cx, cy, groundOnly = false) {
+  function pickAt(cx, cy, groundOnly = false, withTrees = false) {
     if (cx === null) ndc.set(0, 0);
     else ndc.set((cx / window.innerWidth) * 2 - 1, -(cy / window.innerHeight) * 2 + 1);
     raycaster.setFromCamera(ndc, camera);
     const targets = groundOnly ? [terrainMesh, roads] : [roofs, walls, roads, terrainMesh];
+    if (withTrees && trees && trees.group.visible) targets.push(trees.crowns);
     const hits = raycaster.intersectObjects(targets.filter((m) => m.visible), false);
     return hits[0] || null;
   }
@@ -468,6 +479,7 @@ async function main() {
   function select(hit) {
     clearSelection();
     if (!hit || hit.object === terrainMesh) return;
+    if (trees && hit.object === trees.crowns) { showTree(treeData.trees[hit.instanceId]); return; }
     const fid = hit.object.geometry.attributes._feature_id.getX(hit.face.a);
     if (hit.object === roads) {
       app.highlight = highlightFeature([roads], fid);
@@ -487,7 +499,9 @@ async function main() {
   function showBuilding(b) {
     const title = b.addresses?.[0] || b.name || cap(b.type === 'yes' ? 'building' : b.type);
     const extra = b.addresses?.length > 1 ? `<dt>Also</dt><dd>${b.addresses.slice(1).map(esc).join('<br>')}</dd>` : '';
-    const estimated = b.height_source !== 'OSM height tag' && b.height_source !== 'OSM building:levels';
+    const measured = b.height_source.startsWith('LiDAR');
+    const outline = b.osm_id ? osmLink(b.osm_id)
+      : b.source.startsWith('LiDAR') ? 'Traced from 2019 LiDAR roof points' : 'Microsoft ML footprint (2026 release)';
     $('info-body').innerHTML = `
       <div class="kind">Building · ${esc(b.source)}</div>
       <h3>${esc(title)}</h3>
@@ -495,14 +509,32 @@ async function main() {
         ${extra}
         <dt>Type</dt><dd>${esc(cap(b.type))}${b.name && b.name !== title ? ` · ${esc(b.name)}` : ''}</dd>
         <dt>Height</dt><dd>${b.height_m.toFixed(1)} m to top · eave ${b.eave_m.toFixed(1)} m</dd>
-        <dt>Height from</dt><dd><span class="swatch" style="background:${SRC_COLOURS[b.height_source]}"></span>${esc(b.height_source)}</dd>
+        <dt>Height from</dt><dd><span class="swatch" style="background:${SRC_COLOURS[b.height_source]}"></span>${esc(b.height_source)}${measured && b.lidar_coverage ? ` · ${Math.round(b.lidar_coverage * 100)}% of roof seen` : ''}</dd>
         ${b.levels ? `<dt>Levels</dt><dd>${b.levels}</dd>` : ''}
         <dt>Roof</dt><dd>${b.roof_colour ? `<span class="swatch" style="background:${b.roof_colour}"></span>` : ''}${b.roof}${b.roof_colour ? ', colour from 2022 aerial' : ''}</dd>
         <dt>Footprint</dt><dd>${b.footprint_m2.toFixed(0)} m²</dd>
         <dt>Ground</dt><dd>${b.ground_ahd.toFixed(1)} m AHD</dd>
-        <dt>Outline</dt><dd>${b.osm_id ? osmLink(b.osm_id) : 'Microsoft ML footprint (2026 release)'}</dd>
+        <dt>Outline</dt><dd>${outline}</dd>
       </dl>
-      ${estimated ? '<p class="note">Heights are approximate until LiDAR point clouds are added. Roof shape is a modelled hip roof.</p>' : ''}`;
+      <p class="note">${measured
+        ? 'Eave and ridge heights measured from 2019 LiDAR; the roof form is a hip roof fitted between them.'
+        : 'Height is an estimate (no LiDAR roof returns here). Roof form is modelled.'}</p>`;
+    $('info').hidden = false;
+  }
+
+  function showTree(t) {
+    const [x, y, z, h, r] = t;
+    const [lon, lat] = toLonLat(meta, x, z);
+    $('info-body').innerHTML = `
+      <div class="kind">Tree · LiDAR 2019</div>
+      <h3>Tree, ${h.toFixed(1)} m tall</h3>
+      <dl>
+        <dt>Height</dt><dd>${h.toFixed(1)} m above ground</dd>
+        <dt>Crown</dt><dd>about ${(2 * r).toFixed(0)} m across</dd>
+        <dt>Ground</dt><dd>${(y + meta.base_z_ahd).toFixed(1)} m AHD</dd>
+        <dt>Location</dt><dd>${Math.abs(lat).toFixed(5)}°S ${lon.toFixed(5)}°E</dd>
+      </dl>
+      <p class="note">Treetop and crown size detected in the 2019 LiDAR canopy. Species and exact crown shape are not modelled; colour comes from the 2022 aerial photo.</p>`;
     $('info').hidden = false;
   }
 
@@ -531,8 +563,8 @@ async function main() {
     if (!down || e.button !== 0) return;
     const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
     if (moved < 5 && performance.now() - down.t < 500) {
-      if (app.mode === 'orbit') select(pickAt(e.clientX, e.clientY));
-      else if (app.mode === 'walk' && walk.locked) select(pickAt(null, null));
+      if (app.mode === 'orbit') select(pickAt(e.clientX, e.clientY, false, true));
+      else if (app.mode === 'walk' && walk.locked) select(pickAt(null, null, false, true));
     }
     down = null;
   });
@@ -555,11 +587,15 @@ async function main() {
     <table><tr><th>Layer</th><th>Source</th><th>Licence</th></tr>
     ${meta.sources.map((s) => `<tr><td>${esc(s.layer)}</td><td>${esc(s.name)}<br><small>${esc(s.credit)}</small></td><td>${esc(s.licence)}</td></tr>`).join('')}
     </table>
-    <p><b>${meta.counts.buildings}</b> buildings · <b>${meta.counts.roads}</b> road/path segments ·
-    <b>${meta.counts.terrain_triangles.toLocaleString()}</b> terrain triangles. Built ${esc(meta.built)}.</p>
-    <p>Accuracy notes: terrain is surveyed LiDAR (bare earth, ~0.1 m vertical). Building outlines are OSM where
-    mapped, otherwise machine-learned. Building heights are estimates (Microsoft ML or defaults) and roofs are modelled
-    hips — colour each building by height source to see which is which. Road widths are typical values unless tagged.</p>`;
+    <p><b>${meta.counts.buildings}</b> buildings (${meta.counts.lidar_heights || 0} with LiDAR-measured heights,
+    ${meta.counts.lidar_outlines || 0} outlined from LiDAR) · <b>${(meta.counts.trees || 0).toLocaleString()}</b> trees ·
+    <b>${meta.counts.roads}</b> road/path segments · <b>${meta.counts.terrain_triangles.toLocaleString()}</b> terrain
+    triangles. Built ${esc(meta.built)}.</p>
+    <p>Accuracy notes: terrain, building heights and trees come from the 2019 LiDAR survey (about 34 points/m²).
+    Building outlines are OSM where mapped, otherwise Microsoft ML or traced from LiDAR. Roofs are hip roofs fitted
+    between the measured eave and ridge heights, not exact roof shapes. OSM here is shifted ${esc(
+      (meta.alignment?.osm_offset_m || [0, 0]).map((v) => v.toFixed(2)).join(' m E, '))} m N to match the LiDAR.
+    Road widths are typical values unless tagged. Colour buildings by height source to see what is measured.</p>`;
   $('about-link').addEventListener('click', (e) => { e.preventDefault(); $('about').showModal(); });
 
   // ---------------------------------------------------------------- resize, loop
@@ -648,7 +684,7 @@ async function main() {
   }
 
   // Expose for debugging / research scripting in the console.
-  window.theGap = { THREE, scene, camera, renderer, meta, features, terrain, bindex, setMode, jumpTo, walk, xr, orbit };
+  window.theGap = { THREE, scene, camera, renderer, meta, features, terrain, bindex, setMode, jumpTo, walk, xr, orbit, trees };
 }
 
 function makeSkirt(terrain, H) {
@@ -697,4 +733,49 @@ function makeStreetRibbon(street, terrain) {
   g.setIndex(idx);
   return new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xf2a541, transparent: true, opacity: 0.85,
     side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -10, depthWrite: false }));
+}
+
+function makeTrees(rows, lowSpec) {
+  // One instanced crown + trunk per LiDAR treetop: rows = [x, y_ground, z, height, crown_radius, over_roof, hex].
+  let crownGeo = new THREE.IcosahedronGeometry(1, lowSpec ? 0 : 1);
+  crownGeo.deleteAttribute('normal');
+  crownGeo.deleteAttribute('uv');
+  crownGeo = mergeVertices(crownGeo);
+  const p = crownGeo.attributes.position;
+  for (let i = 0; i < p.count; i++) {        // gentle, deterministic lumpiness
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const k = 1 + 0.1 * Math.sin(x * 5.1 + y * 3.7) * Math.cos(z * 4.3 - y * 2.1);
+    p.setXYZ(i, x * k, y * k, z * k);
+  }
+  crownGeo.computeVertexNormals();
+  const trunkGeo = new THREE.CylinderGeometry(1, 1, 1, 6, 1, true).translate(0, 0.5, 0);
+  const n = rows.length;
+  const crowns = new THREE.InstancedMesh(crownGeo, new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0 }), n);
+  const trunks = new THREE.InstancedMesh(trunkGeo, new THREE.MeshStandardMaterial({ color: 0x6b5a48, roughness: 1 }), n);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), pos = new THREE.Vector3();
+  const up = new THREE.Vector3(0, 1, 0), col = new THREE.Color(), fallback = new THREE.Color(0x5d7a45), hsl = {};
+  rows.forEach(([x, y, z, h, r, overRoof, hex], i) => {
+    const base = h * (h > 8 ? 0.4 : 0.28);                  // crown starts higher on tall trees
+    const ry = Math.max((h - base) / 2, 0.6);
+    const rx = Math.max(r, 0.8);
+    q.setFromAxisAngle(up, (i * 2.399963) % (Math.PI * 2));
+    crowns.setMatrixAt(i, m.compose(pos.set(x, y + base + ry, z), q, s.set(rx, ry, rx)));
+    if (hex) {                                              // photo colour, lifted out of the shadows
+      col.set('#' + hex).getHSL(hsl);
+      col.setHSL(hsl.h, Math.min(hsl.s * 1.1, 0.55), THREE.MathUtils.clamp(hsl.l * 1.3, 0.2, 0.55));
+    } else col.copy(fallback);
+    crowns.setColorAt(i, col);
+    const tr = overRoof ? 0 : 0.1 + 0.012 * h;              // crowns over roofs: hide the trunk
+    trunks.setMatrixAt(i, m.compose(pos.set(x, y - 0.3, z), q, s.set(tr, overRoof ? 0 : base + ry * 0.6 + 0.3, tr)));
+  });
+  crowns.instanceMatrix.needsUpdate = trunks.instanceMatrix.needsUpdate = true;
+  crowns.instanceColor.needsUpdate = true;
+  crowns.computeBoundingSphere();
+  trunks.computeBoundingSphere();
+  crowns.castShadow = crowns.receiveShadow = true;
+  trunks.castShadow = trunks.receiveShadow = true;
+  const group = new THREE.Group();
+  group.name = 'trees';
+  group.add(crowns, trunks);
+  return { group, crowns, trunks };
 }

@@ -21,6 +21,7 @@ import buildings  # noqa: E402
 import roads  # noqa: E402
 from common import CONFIG, RAW, ROOT, WEB_DATA, write_json  # noqa: E402
 from glb import write_glb  # noqa: E402
+from lidar_features import LidarGrids  # noqa: E402
 from terrain import Terrain  # noqa: E402
 
 Image.MAX_IMAGE_PIXELS = None
@@ -37,6 +38,10 @@ SOURCES = [
     {"layer": "Gap-fill buildings + height estimates", "name": "Microsoft Global ML Building Footprints",
      "licence": "ODbL 1.0", "credit": "© Microsoft"},
 ]
+LIDAR_SOURCE = {"layer": "Building heights, extra buildings, trees",
+                "name": "Queensland LiDAR Data - Brisbane 2019 Project (classified point cloud, via ELVIS)",
+                "licence": "CC BY 4.0", "credit": "© State of Queensland (Department of Resources); "
+                "distributed by Geoscience Australia (ELVIS)"}
 
 
 def to_three(pos_local, base_z):
@@ -103,13 +108,26 @@ def main():
     print(f"  TIN {len(terrain.vertices)} vertices / {len(terrain.triangles)} triangles; "
           f"z {terrain.zmin:.1f}..{terrain.zmax:.1f} m AHD; base_z {base_z}")
 
+    lidar = None
+    if LidarGrids.available():
+        lidar = LidarGrids(terrain)
+        print(f"  LiDAR grids: {lidar.n} x {lidar.n} cells at 0.5 m")
+    else:
+        print("  (no LiDAR grids - run prepare_lidar.py for measured heights and trees)")
+
     print("Buildings ...")
-    walls, roofs_, bfeats = buildings.build(terrain, H)
+    walls, roofs_, bfeats = buildings.build(terrain, H, lidar)
     print("Roads ...")
     road_arr, rfeats, ways = roads.build(terrain, H)
     labels = roads.street_labels(ways, terrain, H)
+    trees = []
+    if lidar is not None:
+        print("Trees ...")
+        trees = lidar.trees([shapely.Polygon(b["footprint"]) for b in bfeats], buildings.OrthoSampler(H))
+        print(f"  {len(trees)} trees from the canopy height model "
+              f"(median height {np.median([t['h'] for t in trees]):.1f} m)")
 
-    local = buildings.Local()
+    local = buildings.Local.osm()
     osm = json.loads((RAW / "osm" / "osm.json").read_text())
     ring, ring_z, street = focus_outline(terrain, H, local, osm)
 
@@ -147,8 +165,12 @@ def main():
                           for (x, n), z in zip(ring, ring_z)],
         "focus_street": [[round(float(x), 2), round(float(-n), 2)] for x, n in street],
         "counts": {"buildings": len(bfeats), "roads": len(rfeats), "labels": len(labels),
-                   "terrain_triangles": int(len(terrain.triangles))},
-        "sources": SOURCES,
+                   "terrain_triangles": int(len(terrain.triangles)), "trees": len(trees),
+                   "lidar_heights": sum(1 for b in bfeats if b["height_source"].startswith("LiDAR")),
+                   "lidar_outlines": sum(1 for b in bfeats if b["source"].startswith("LiDAR"))},
+        "alignment": {"osm_offset_m": CONFIG.get("osm_offset_m", {}).get("east_north", [0, 0]),
+                      "note": CONFIG.get("osm_offset_m", {}).get("note", "")},
+        "sources": SOURCES + ([LIDAR_SOURCE] if lidar is not None else []),
     }
 
     print("Writing web/data ...")
@@ -161,6 +183,14 @@ def main():
     lab3 = [{"text": l["text"], "x": l["x"], "y": round(l["z"] - base_z, 2), "z": -l["n"],
              "angle": l["angle"]} for l in labels]
     write_json(WEB_DATA / "features.json", {"buildings": bfeats, "roads": rfeats, "labels": lab3})
+    rows = [[round(t["x"], 2), round(t["ground"] - base_z, 2), round(-t["n"], 2), round(t["h"], 1),
+             round(t["r"], 1), int(t["on_roof"]),
+             "%02x%02x%02x" % tuple(int(v * 255) for v in t["colour"]) if t["colour"] is not None else ""]
+            for t in trees]
+    write_json(WEB_DATA / "trees.json", {
+        "fields": ["x", "y_ground", "z", "height_m", "crown_radius_m", "over_roof", "colour"],
+        "source": "Treetops and crowns from the Brisbane 2019 LiDAR canopy height model (classes 3-5)",
+        "trees": rows})
 
     px = CONFIG["imagery"]["size_px"]
     ortho = Image.open(RAW / "imagery" / f"ortho_{px}.jpg").convert("RGB")
@@ -187,6 +217,12 @@ def main():
         gj["features"].append({"type": "Feature", "properties": props,
                                "geometry": {"type": "Polygon", "coordinates": [ring_ll]}})
     write_json(ROOT / "export" / "buildings.geojson", gj)
+    if trees:
+        lines = ["x_east_m,y_north_m,ground_ahd_m,height_m,crown_radius_m,lon,lat"]
+        for t in trees:
+            lon, lat = to_ll_local.transform(E0 + t["x"], N0 + t["n"])
+            lines.append(f"{t['x']:.2f},{t['n']:.2f},{t['ground']:.2f},{t['h']:.1f},{t['r']:.1f},{lon:.7f},{lat:.7f}")
+        (ROOT / "export" / "trees.csv").write_text("\n".join(lines) + "\n")
 
     sizes = {p.name: f"{p.stat().st_size / 1e6:.1f} MB" for p in sorted(WEB_DATA.iterdir())}
     print(f"  {sizes}")

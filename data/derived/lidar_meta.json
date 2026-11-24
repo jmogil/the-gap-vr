@@ -1,0 +1,87 @@
+{
+  "source": "Queensland LiDAR Data - Brisbane 2019 Project (QLD Government), via ELVIS (Geoscience Australia)",
+  "elvis_package": "DATA_19775.zip",
+  "tiles": [
+    {
+      "file": "Brisbane_2019_Prj_SW_495000_6965000_1k_class_AHD.laz",
+      "points": 43578010,
+      "crs": "EPSG:28356",
+      "shift_to_gda2020_m": [
+        0.597,
+        1.392
+      ],
+      "point_format": 6,
+      "las_version": "1.4"
+    },
+    {
+      "file": "Brisbane_2019_Prj_SW_495000_6963000_1k_class_AHD.laz",
+      "points": 35493582,
+      "crs": "EPSG:28356",
+      "shift_to_gda2020_m": [
+        0.597,
+        1.392
+      ],
+      "point_format": 6,
+      "las_version": "1.4"
+    },
+    {
+      "file": "Brisbane_2019_Prj_SW_494000_6965000_1k_class_AHD.laz",
+      "points": 28717825,
+      "crs": "EPSG:28356",
+      "shift_to_gda2020_m": [
+        0.597,
+        1.392
+      ],
+      "point_format": 6,
+      "las_version": "1.4"
+    },
+    {
+      "file": "Brisbane_2019_Prj_SW_495000_6964000_1k_class_AHD.laz",
+      "points": 35047398,
+      "crs": "EPSG:28356",
+      "shift_to_gda2020_m": [
+        0.597,
+        1.392
+      ],
+      "point_format": 6,
+      "las_version": "1.4"
+    },
+    {
+      "file": "Brisbane_2019_Prj_SW_494000_6964000_1k_class_AHD.laz",
+      "points": 27709991,
+      "crs": "EPSG:28356",
+      "shift_to_gda2020_m": [
+        0.597,
+        1.392
+      ],
+      "point_format": 6,
+      "las_version": "1.4"
+    },
+    {
+      "file": "Brisbane_2019_Prj_SW_494000_6963000_1k_class_AHD.laz",
+      "points": 31885810,
+      "crs": "EPSG:28356",
+      "shift_to_gda2020_m": [
+        0.597,
+        1.392
+      ],
+      "point_format": 6,
+      "las_version": "1.4"
+    }
+  ],
+  "grid_resolution_m": 0.5,
+  "grid_note": "uint16 centimetres AHD, 0 = no data; row 0 = north edge; same square as config.json",
+  "class_counts": {
+    "1 unclassified": 341387,
+    "2 ground": 55750518,
+    "3 low vegetation": 11319557,
+    "4 medium vegetation": 10163039,
+    "5 high vegetation": 106181222,
+    "6 building": 18469844,
+    "7 low noise": 21063,
+    "9 water": 6583,
+    "17 bridge deck": 167886,
+    "19": 11517
+  },
+  "laz_cache": "~/Library/Caches/the-gap-vr/lidar"
+}
