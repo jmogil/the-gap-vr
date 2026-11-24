@@ -9,6 +9,10 @@
     "northing": 6964541
   },
   "half_size_m": 600,
+  "osm_offset_m": {
+    "east_north": [0.60, 1.39],
+    "note": "OSM here was traced from GDA94-era imagery and sits ~1.5 m SW of the 2019 LiDAR, DTM and aerial photo (all GDA2020). Shifting OSM by the GDA94->GDA2020 difference raises its overlap with LiDAR roofs from IoU 0.38 to 0.42; Microsoft footprints and imagery need no shift."
+  },
   "focus_buffer_m": 500,
   "dem": {
     "service": "https://spatial-img.information.qld.gov.au/arcgis/rest/services/Elevation/QldDem/ImageServer",

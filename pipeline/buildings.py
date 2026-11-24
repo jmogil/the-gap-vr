@@ -61,12 +61,19 @@ def _num(v):
 
 
 class Local:
-    """WGS84 lon/lat -> local (x east, north) metres relative to the anchor."""
+    """WGS84 lon/lat -> local (x east, north) metres relative to the anchor.
 
-    def __init__(self):
+    `offset` (east, north) corrects sources that are systematically misaligned; OSM here
+    was traced from GDA94-era imagery and sits ~1.5 m SW of the LiDAR (see config.json)."""
+
+    def __init__(self, offset=(0.0, 0.0)):
         self.t = Transformer.from_crs("EPSG:4326", "EPSG:7856", always_xy=True)
-        self.E0 = CONFIG["anchor"]["easting"]
-        self.N0 = CONFIG["anchor"]["northing"]
+        self.E0 = CONFIG["anchor"]["easting"] - float(offset[0])
+        self.N0 = CONFIG["anchor"]["northing"] - float(offset[1])
+
+    @classmethod
+    def osm(cls):
+        return cls(CONFIG.get("osm_offset_m", {}).get("east_north", (0.0, 0.0)))
 
     def __call__(self, lon, lat):
         x, y = self.t.transform(lon, lat)
@@ -78,8 +85,10 @@ class Local:
         return np.column_stack([x, n])
 
 
-def load_footprints(local: Local, H: float):
-    """Return list of dicts with polygon (local coords) + source attributes."""
+def load_footprints(local: Local, H: float, local_ms: Local = None):
+    """Return list of dicts with polygon (local coords) + source attributes.
+    `local` converts OSM coordinates, `local_ms` the Microsoft footprints."""
+    local_ms = local_ms or Local()
     inside = shapely.box(-H + 1, -H + 1, H - 1, H - 1)
     osm = json.loads((RAW / "osm" / "osm.json").read_text())
     out, addr_pts = [], []
@@ -110,7 +119,7 @@ def load_footprints(local: Local, H: float):
         g = shape(f["geometry"])
         if g.geom_type != "Polygon":
             continue
-        poly = Polygon(local.ring(g.exterior.coords))
+        poly = Polygon(local_ms.ring(g.exterior.coords))
         if not poly.is_valid:
             poly = poly.buffer(0)
             if poly.geom_type != "Polygon":
@@ -195,14 +204,38 @@ class OrthoSampler:
             return None
         return np.median(pix[keep], axis=0) / 255.0
 
+    def crown_colour(self, x, n, radius):
+        """Median canopy colour (sRGB 0-1) in a disc around a treetop, or None."""
+        s = self.px / (2 * self.H)
+        cx, cy, rr = (x + self.H) * s, (self.H - n) * s, max(radius * s, 2)
+        c0, c1 = int(max(cx - rr, 0)), int(min(cx + rr + 1, self.px))
+        r0, r1 = int(max(cy - rr, 0)), int(min(cy + rr + 1, self.px))
+        if c1 - c0 < 2 or r1 - r0 < 2:
+            return None
+        yy, xx = np.mgrid[r0:r1, c0:c1]
+        pix = self.arr[r0:r1, c0:c1][(xx - cx) ** 2 + (yy - cy) ** 2 <= rr * rr].astype(np.int32)
+        lum = 0.299 * pix[:, 0] + 0.587 * pix[:, 1] + 0.114 * pix[:, 2]
+        pix = pix[(lum > 25) & (lum < 200)]
+        return None if len(pix) < 6 else np.median(pix, axis=0) / 255.0
 
-def _height_info(b, kind, skel_h):
+
+def _height_info(b, kind, skel_h, lidar=None):
     pitch, max_rise, min_eave, default_total = ROOF[kind]
     t = b["tags"]
     slope = math.tan(math.radians(pitch))
     cap_d = max_rise / slope
     rise = slope * min(skel_h, cap_d)
     levels = _num(t.get("building:levels"))
+    if lidar is not None:
+        # Measured: ridge and eave straight from the 2019 LiDAR; the hip roof is fitted to them.
+        total, eave = max(lidar["total"], 2.0), max(min(lidar["eave"], lidar["total"]), 1.8)
+        rise = total - eave
+        if rise < 0.5 or skel_h <= 0.2:
+            return dict(total=total, eave=total, rise=0.0, slope=0.0, cap_d=0.0, levels=levels,
+                        src="LiDAR 2019 (measured)")
+        slope = min(rise / skel_h, math.tan(math.radians(38)))
+        return dict(total=total, eave=eave, rise=rise, slope=slope, cap_d=rise / slope, levels=levels,
+                    src="LiDAR 2019 (measured)")
     if _num(t.get("height")):
         total, src = _num(t.get("height")), "OSM height tag"
     elif levels:
@@ -282,9 +315,16 @@ def _halfplane_poly(n, d, R, centre):
     return Polygon([p0 + L * t, p0 - L * t, p0 - L * t - L * n, p0 + L * t - L * n])
 
 
-def build(terrain, H):
-    local = Local()
-    blds, addr_pts = load_footprints(local, H)
+SOURCE_NAMES = {"osm": "OpenStreetMap", "ms": "Microsoft ML footprint", "lidar": "LiDAR 2019 outline"}
+
+
+def build(terrain, H, lidar=None):
+    blds, addr_pts = load_footprints(Local.osm(), H, Local())
+    if lidar is not None:
+        inside = shapely.box(-H + 1, -H + 1, H - 1, H - 1)
+        extra = [p for p in lidar.extra_buildings([b["poly"] for b in blds]) if inside.contains(p)]
+        blds += [{"poly": p, "src": "lidar", "osm_id": None, "tags": {}} for p in extra]
+        print(f"  LiDAR found {len(extra)} buildings missing from OSM and Microsoft")
     assign_addresses(blds, addr_pts)
     ortho = OrthoSampler(H)
     walls, roofs = MeshBuilder(), MeshBuilder()
@@ -300,15 +340,16 @@ def build(terrain, H):
         faces, skel_h = skeleton_faces(P)
         if faces is None:
             faces, skel_h = [], 0.0
-        h = _height_info(b, kind, skel_h)
-        if not faces:
-            h.update(slope=0.0, rise=0.0, eave=h["total"])
         fid = len(feats)
         ring = np.asarray(P.exterior.coords)[:-1]
         c = np.asarray(P.centroid.coords[0])
         gz = terrain.height(np.r_[ring[:, 0], c[0]], np.r_[ring[:, 1], c[1]])
         ground = float(np.median(gz))
         base = float(gz.min()) - 0.4
+        lstats = lidar.building_stats(P, ground) if lidar is not None else None
+        h = _height_info(b, kind, skel_h, lstats)
+        if not faces:
+            h.update(slope=0.0, rise=0.0, eave=h["total"])
         eave_abs = ground + h["eave"]
 
         rc = ortho.roof_colour(P)
@@ -380,7 +421,8 @@ def build(terrain, H):
         stats[h["src"]] = stats.get(h["src"], 0) + 1
         feats.append({
             "id": fid,
-            "source": "OpenStreetMap" if b["src"] == "osm" else "Microsoft ML footprint",
+            "source": SOURCE_NAMES[b["src"]],
+            "lidar_coverage": lstats["coverage"] if lstats else None,
             "osm_id": b["osm_id"],
             "type": b["tags"].get("building", "yes"),
             "kind": kind,

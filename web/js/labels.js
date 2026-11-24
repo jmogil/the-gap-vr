@@ -33,7 +33,7 @@ function labelTexture(text, highlight) {
 
 export function makeLabel(text, highlight = false) {
   const { tex, aspect } = labelTexture(text, highlight);
-  const mat = new THREE.SpriteMaterial({ map: tex, sizeAttenuation: false, depthTest: true, transparent: true });
+  const mat = new THREE.SpriteMaterial({ map: tex, sizeAttenuation: false, depthTest: false, depthWrite: false, transparent: true });
   const s = new THREE.Sprite(mat);
   const hgt = highlight ? 0.042 : 0.034;
   s.scale.set(hgt * aspect, hgt, 1);
