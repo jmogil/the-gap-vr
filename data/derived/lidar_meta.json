@@ -1,43 +1,10 @@
 {
   "source": "Queensland LiDAR Data - Brisbane 2019 Project (QLD Government), via ELVIS (Geoscience Australia)",
-  "elvis_package": "DATA_19775.zip",
+  "elvis_package": "lidar",
   "tiles": [
     {
-      "file": "Brisbane_2019_Prj_SW_495000_6965000_1k_class_AHD.laz",
-      "points": 43578010,
-      "crs": "EPSG:28356",
-      "shift_to_gda2020_m": [
-        0.597,
-        1.392
-      ],
-      "point_format": 6,
-      "las_version": "1.4"
-    },
-    {
-      "file": "Brisbane_2019_Prj_SW_495000_6963000_1k_class_AHD.laz",
-      "points": 35493582,
-      "crs": "EPSG:28356",
-      "shift_to_gda2020_m": [
-        0.597,
-        1.392
-      ],
-      "point_format": 6,
-      "las_version": "1.4"
-    },
-    {
-      "file": "Brisbane_2019_Prj_SW_494000_6965000_1k_class_AHD.laz",
-      "points": 28717825,
-      "crs": "EPSG:28356",
-      "shift_to_gda2020_m": [
-        0.597,
-        1.392
-      ],
-      "point_format": 6,
-      "las_version": "1.4"
-    },
-    {
-      "file": "Brisbane_2019_Prj_SW_495000_6964000_1k_class_AHD.laz",
-      "points": 35047398,
+      "file": "Brisbane_2019_Prj_SW_494000_6963000_1k_class_AHD.laz",
+      "points": 31885810,
       "crs": "EPSG:28356",
       "shift_to_gda2020_m": [
         0.597,
@@ -58,8 +25,41 @@
       "las_version": "1.4"
     },
     {
-      "file": "Brisbane_2019_Prj_SW_494000_6963000_1k_class_AHD.laz",
-      "points": 31885810,
+      "file": "Brisbane_2019_Prj_SW_494000_6965000_1k_class_AHD.laz",
+      "points": 28717825,
+      "crs": "EPSG:28356",
+      "shift_to_gda2020_m": [
+        0.597,
+        1.392
+      ],
+      "point_format": 6,
+      "las_version": "1.4"
+    },
+    {
+      "file": "Brisbane_2019_Prj_SW_495000_6963000_1k_class_AHD.laz",
+      "points": 35493582,
+      "crs": "EPSG:28356",
+      "shift_to_gda2020_m": [
+        0.597,
+        1.392
+      ],
+      "point_format": 6,
+      "las_version": "1.4"
+    },
+    {
+      "file": "Brisbane_2019_Prj_SW_495000_6964000_1k_class_AHD.laz",
+      "points": 35047398,
+      "crs": "EPSG:28356",
+      "shift_to_gda2020_m": [
+        0.597,
+        1.392
+      ],
+      "point_format": 6,
+      "las_version": "1.4"
+    },
+    {
+      "file": "Brisbane_2019_Prj_SW_495000_6965000_1k_class_AHD.laz",
+      "points": 43578010,
       "crs": "EPSG:28356",
       "shift_to_gda2020_m": [
         0.597,

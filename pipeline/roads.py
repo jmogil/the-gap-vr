@@ -31,6 +31,7 @@ GROUP_OF = {hw: g for g, s in GROUPS for hw in s}
 COLOURS = {  # sRGB
     "major": (62, 64, 68), "minor": (74, 76, 80), "service": (88, 90, 94),
     "path": (196, 191, 180), "path_unpaved": (156, 136, 100), "bridge_side": (170, 168, 160),
+    "driveway": (176, 172, 164),
 }
 UNPAVED = {"dirt", "ground", "gravel", "grass", "unpaved", "compacted", "fine_gravel", "earth", "mud",
            "sand", "woodchips", "rock", "pebblestone"}
@@ -124,6 +125,7 @@ def build(terrain, H):
     mesh = Mesh()
     feats = []
     taken = Polygon()
+    carriage, driveways = [], []
     order = {g: i for i, (g, _) in enumerate(GROUPS)}
     ways.sort(key=lambda w: (order[w["group"]], -w["width"], -w["line"].length))
     # Add turning circles (cul-de-sac bulbs) to the nearest minor road.
@@ -140,6 +142,8 @@ def build(terrain, H):
         t = w["tags"]
         group = w["group"]
         colour_key = "path_unpaved" if group == "path" and t.get("surface") in UNPAVED else group
+        if t.get("service") == "driveway" and t.get("surface") not in UNPAVED:
+            colour_key = "driveway"
         colour = srgb_to_linear(np.array(COLOURS[colour_key]) / 255.0)
         feats.append({
             "id": fid, "osm_id": w["osm_id"], "name": t.get("name"), "ref": t.get("ref"),
@@ -156,6 +160,10 @@ def build(terrain, H):
         for b in bulbs.get(id(w), []):
             poly = poly.union(b)
         poly = poly.intersection(square)
+        if group in ("major", "minor"):
+            carriage.append(poly)
+        elif t.get("service") == "driveway":
+            driveways.append(poly)
         piece = poly.difference(taken) if not taken.is_empty else poly
         taken = taken.union(poly)
         if piece.is_empty:
@@ -163,7 +171,9 @@ def build(terrain, H):
         _drape(mesh, piece, tree, tri_polys, A, B, C, colour, fid)
     print(f"  roads: {len(feats)} OSM highway ways "
           f"({sum(1 for f in feats if f['bridge'])} bridges), {mesh.n} vertices")
-    return mesh.arrays(), feats, ways
+    extras = {"carriageway": shapely.union_all(carriage) if carriage else Polygon(),
+              "driveways": shapely.union_all(driveways) if driveways else Polygon()}
+    return mesh.arrays(), feats, ways, extras
 
 
 def _drape(mesh, piece, tree, tri_polys, A, B, C, colour, fid):

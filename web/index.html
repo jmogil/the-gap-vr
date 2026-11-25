@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>The Gap 3D</title>
-  <meta name="description" content="Open-data 3D model of Yuruga Street, The Gap (Brisbane) and its surrounding 500 m: LiDAR terrain, roads and buildings, explorable in a browser or in VR.">
+  <meta name="description" content="Open-data 3D model of The Gap, Brisbane: LiDAR terrain, roads, buildings, trees and streetscape, explorable in a browser or in VR.">
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="css/app.css">
   <script type="importmap">
@@ -30,7 +30,7 @@
     <header>
       <div>
         <h1>The Gap <span>3D</span></h1>
-        <p class="sub">Yuruga Street + 500 m · Brisbane, QLD</p>
+        <p class="sub">Brisbane, QLD · 1.2 km × 1.2 km</p>
       </div>
       <button id="panel-toggle" class="icon-btn" aria-label="Collapse panel" title="Collapse panel">–</button>
     </header>
@@ -51,11 +51,13 @@
         <label class="chk"><input type="checkbox" id="lyr-buildings" checked> Buildings</label>
         <label class="chk"><input type="checkbox" id="lyr-roads" checked> Roads &amp; paths</label>
         <label class="chk"><input type="checkbox" id="lyr-trees" checked> Trees (LiDAR 2019)</label>
+        <label class="chk"><input type="checkbox" id="lyr-fences" checked> Fences (from lot lines)</label>
+        <label class="chk"><input type="checkbox" id="lyr-furniture" checked> Poles, lights &amp; signs</label>
+        <label class="chk"><input type="checkbox" id="lyr-lots"> Lot boundaries</label>
         <label class="chk"><input type="checkbox" id="lyr-labels" checked> Street names</label>
         <label class="chk"><input type="checkbox" id="lyr-aerial" checked> Aerial photo on ground</label>
         <label class="chk"><input type="checkbox" id="lyr-photoroofs"> Photo-textured roofs</label>
         <label class="chk"><input type="checkbox" id="lyr-heightsrc"> Colour buildings by height source</label>
-        <label class="chk"><input type="checkbox" id="lyr-focus" checked> 500 m study area</label>
         <label class="chk"><input type="checkbox" id="lyr-shadows" checked> Shadows</label>
       </section>
 
