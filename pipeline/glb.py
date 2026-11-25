@@ -52,6 +52,10 @@ def write_glb(path, meshes, extras=None, image_jpeg: bytes | None = None):
             attrs["TEXCOORD_0"] = accessor(m["uv"].astype(np.float32), FLOAT, "VEC2", ARRAY_BUFFER)
         if m.get("fid") is not None:
             attrs["_FEATURE_ID"] = accessor(m["fid"].astype(np.float32), FLOAT, "SCALAR", ARRAY_BUFFER)
+        for name, arr in (m.get("extra_attrs") or {}).items():   # custom attributes must start with "_"
+            arr = np.asarray(arr, np.float32)
+            typ = {1: "SCALAR", 2: "VEC2", 3: "VEC3", 4: "VEC4"}[1 if arr.ndim == 1 else arr.shape[1]]
+            attrs[name] = accessor(arr, FLOAT, typ, ARRAY_BUFFER)
         idx = accessor(m["idx"].astype(np.uint32).reshape(-1), UINT32, "SCALAR", ELEMENT_ARRAY_BUFFER)
         mat = m.get("material", {})
         pbr = {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0.0,

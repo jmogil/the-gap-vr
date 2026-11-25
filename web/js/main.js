@@ -1,4 +1,4 @@
-// The Gap 3D — open-data model of Yuruga Street, The Gap (Brisbane) and its surrounding 500 m.
+// The Gap 3D — open-data model of a 1.2 km × 1.2 km area of The Gap, Brisbane.
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -11,6 +11,7 @@ import { XRLocomotion } from './xr.js';
 import { sunPosition, brisbaneDate, brisbaneToday } from './sun.js';
 import { Minimap } from './minimap.js';
 import { makeLabel } from './labels.js';
+import { buildStreetscape, buildLotLines, LotIndex, palingTexture, applyFacade } from './streetscape.js';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
@@ -130,6 +131,16 @@ async function main() {
   terrainMesh.material = mats.terrainPhoto;
   roads.material = mats.roads;
   walls.material = mats.walls;
+  applyFacade(mats.walls);                          // windows per storey + weatherboards
+  const kerbs = meshes.kerbs, fences = meshes.fences;
+  if (kerbs) {
+    kerbs.material = new THREE.MeshStandardMaterial({ color: 0xbdb9b1, roughness: 0.9 });
+    kerbs.receiveShadow = kerbs.castShadow = true;
+  }
+  if (fences) {
+    fences.material = new THREE.MeshStandardMaterial({ map: palingTexture(), alphaTest: 0.5, side: THREE.DoubleSide, roughness: 1 });
+    fences.receiveShadow = fences.castShadow = true;
+  }
   roofs.material = mats.roofs;
   terrainMesh.receiveShadow = true;
   roads.receiveShadow = true;
@@ -157,29 +168,12 @@ async function main() {
   // Diorama skirt around the edge of the terrain.
   scene.add(makeSkirt(terrain, H));
 
-  // ---------------------------------------------------------------- study area + Yuruga St
-  const focus = new THREE.Group();
-  const outlinePts = meta.focus_outline.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
-  const outline = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(outlinePts),
-    new THREE.LineDashedMaterial({ color: 0xf2a541, dashSize: 8, gapSize: 6, transparent: true, opacity: 0.95 }));
-  outline.computeLineDistances();
-  focus.add(outline);
-  const ribbon = makeStreetRibbon(meta.focus_street, terrain);   // overview only
-  focus.add(ribbon);
-  scene.add(focus);
-
   // ---------------------------------------------------------------- street labels
   const labels = new THREE.Group();
   for (const l of features.labels) {
-    const s = makeLabel(l.text, l.text === 'Yuruga Street');
+    const s = makeLabel(l.text);
     s.position.set(l.x, l.y + 6, l.z);
-    s.userData.priority = l.text === 'Yuruga Street' ? 0 : 1;
-    labels.add(s);
-  }
-  if (!features.labels.some((l) => l.text === 'Yuruga Street')) {
-    const s = makeLabel('Yuruga Street', true);
-    s.position.set(0, terrain.heightAt(0, 0) + 6, 0);
-    s.userData.priority = 0;
+    s.userData.priority = 1;
     labels.add(s);
   }
   scene.add(labels);
@@ -207,6 +201,13 @@ async function main() {
 
   // ---------------------------------------------------------------- trees (2019 LiDAR canopy)
   const treeData = await fetchJSON('data/trees.json').catch(() => null);
+  const [lotData, streetData] = await Promise.all([
+    fetchJSON('data/lots.json').catch(() => null), fetchJSON('data/streetscape.json').catch(() => null)]);
+  const street = streetData ? buildStreetscape(streetData) : null;
+  if (street) scene.add(street.group);
+  const lotLines = lotData ? buildLotLines(lotData, terrain) : null;
+  if (lotLines) scene.add(lotLines);
+  const lotIndex = lotData ? new LotIndex(lotData.lots) : null;
   const trees = treeData && treeData.trees.length ? makeTrees(treeData.trees, isMobile) : null;
   if (trees) scene.add(trees.group);
 
@@ -226,9 +227,7 @@ async function main() {
   const walk = new WalkControls(camera, renderer.domElement, terrain, bindex);
   const xr = new XRLocomotion({ renderer, scene, rig, camera, terrain, buildings: bindex });
 
-  const st = meta.focus_street;
-  const sdx = st[st.length - 1][0] - st[0][0], sdz = st[st.length - 1][1] - st[0][1];
-  const startYaw = Math.atan2(-sdx, -sdz);          // look along Yuruga Street
+  const start = meta.start || { x: 0, z: 0, yaw: 0 };   // a street near the model centre
 
   const app = { mode: 'orbit', selected: null, highlight: null, shadowHalf: 0 };
   const minimap = new Minimap($('minimap'), meta, 'data/' + meta.imagery.files['1024'], (x, z) => jumpTo(x, z));
@@ -296,7 +295,7 @@ async function main() {
       let x = opts.x ?? orbit.target.x, z = opts.z ?? orbit.target.z;
       let yaw = opts.yaw;
       if (opts.x === undefined && prev === 'orbit' && Math.hypot(orbit.target.x, orbit.target.z) < 1) {
-        x = 0; z = 0; yaw = startYaw;      // first walk: stand on Yuruga Street
+        x = start.x; z = start.z; yaw = start.yaw;   // first walk: a street near the centre
       }
       if (yaw === undefined) {
         const d = new THREE.Vector3().subVectors(orbit.target, camera.position);
@@ -322,9 +321,8 @@ async function main() {
     $('walk-overlay').hidden = !(m === 'walk' && !walk.locked);
     $('mode-hint').textContent = m === 'walk'
       ? (walk.fly ? 'Flying — E/Q to rise/sink, F to land.' : 'Walking at street level (eye height 1.65 m).')
-      : m === 'vr' ? 'In VR — take off the headset to return.' : 'Overview of the study area.';
+      : m === 'vr' ? 'In VR — take off the headset to return.' : 'Overview of the area.';
     labels.visible = $('lyr-labels').checked && m !== 'vr';
-    ribbon.visible = m === 'orbit';
   }
   walk.onChange = syncModeUI;
 
@@ -384,7 +382,7 @@ async function main() {
     if (app.mode === 'walk') {
       x = walk.pos.x; z = walk.pos.z; yaw = walk.yaw;
     } else {
-      [x, z] = freeSpot(0, 0); yaw = startYaw;
+      [x, z] = freeSpot(start.x, start.z); yaw = start.yaw;
     }
     walk.disable();
     orbit.enabled = false;
@@ -407,11 +405,13 @@ async function main() {
   // ---------------------------------------------------------------- layers
   const lyr = (id, fn) => { $(id).addEventListener('change', (e) => fn(e.target.checked)); fn($(id).checked); };
   lyr('lyr-buildings', (on) => { walls.visible = roofs.visible = on; clearSelection(); });
-  lyr('lyr-roads', (on) => { roads.visible = on; });
+  lyr('lyr-roads', (on) => { roads.visible = on; if (kerbs) kerbs.visible = on; });
+  lyr('lyr-fences', (on) => { if (fences) fences.visible = on; });
+  lyr('lyr-furniture', (on) => { if (street) street.group.visible = on; });
+  lyr('lyr-lots', (on) => { if (lotLines) lotLines.visible = on; });
   lyr('lyr-labels', () => syncModeUI());
   lyr('lyr-aerial', (on) => { terrainMesh.material = on ? mats.terrainPhoto : mats.terrainPlain; });
   lyr('lyr-photoroofs', (on) => { roofs.material = on ? mats.roofsPhoto : mats.roofs; });
-  lyr('lyr-focus', (on) => { focus.visible = on; });
   lyr('lyr-shadows', (on) => { sun.castShadow = on; });
   lyr('lyr-trees', (on) => { if (trees) trees.group.visible = on; });
   if (!trees) $('lyr-trees').closest('label').hidden = true;
@@ -448,6 +448,7 @@ async function main() {
     raycaster.setFromCamera(ndc, camera);
     const targets = groundOnly ? [terrainMesh, roads] : [roofs, walls, roads, terrainMesh];
     if (withTrees && trees && trees.group.visible) targets.push(trees.crowns);
+    if (withTrees && street && street.group.visible) targets.push(...street.pick);
     const hits = raycaster.intersectObjects(targets.filter((m) => m.visible), false);
     return hits[0] || null;
   }
@@ -478,8 +479,14 @@ async function main() {
 
   function select(hit) {
     clearSelection();
-    if (!hit || hit.object === terrainMesh) return;
+    if (!hit) return;
+    if (hit.object === terrainMesh) {                  // bare ground: which lot is this?
+      const lot = lotIndex?.at(hit.point.x, hit.point.z);
+      if (lot) showLot(lot);
+      return;
+    }
     if (trees && hit.object === trees.crowns) { showTree(treeData.trees[hit.instanceId]); return; }
+    if (hit.object.userData?.kind) { showFurniture(hit.object.userData.kind, hit.object.userData.records[hit.instanceId]); return; }
     const fid = hit.object.geometry.attributes._feature_id.getX(hit.face.a);
     if (hit.object === roads) {
       app.highlight = highlightFeature([roads], fid);
@@ -530,6 +537,48 @@ async function main() {
     if (b.roof_from === 'LiDAR surface') return 'measured LiDAR surface';
     if (b.roof_from === 'LiDAR fit') return `fitted to LiDAR (±${(b.roof_fit_rms_m * 100).toFixed(0)} cm)`;
     return b.roof_from || 'modelled';
+  }
+
+  function showLot(l) {
+    const title = l.type === 'Lot Type Parcel' ? `Lot ${l.lot} on ${l.plan}` : (l.name || l.type || 'Parcel');
+    $('info-body').innerHTML = `
+      <div class="kind">Land parcel · QLD cadastre</div>
+      <h3>${esc(title)}</h3>
+      <dl>
+        <dt>Lot/plan</dt><dd>${esc(l.lotplan || '—')}</dd>
+        <dt>Type</dt><dd>${esc(l.type || '—')}</dd>
+        ${l.tenure ? `<dt>Tenure</dt><dd>${esc(l.tenure)}</dd>` : ''}
+        <dt>Area</dt><dd>${Number(l.area_m2).toLocaleString()} m²</dd>
+        ${l.name ? `<dt>Name</dt><dd>${esc(l.name)}</dd>` : ''}
+        <dt>Accuracy</dt><dd>${esc((l.accuracy || '').replace(/^.*-\s*/, '±') || '—')}</dd>
+      </dl>
+      <p class="note">Boundaries from the Digital Cadastral Database (CC BY 4.0). Fences in the model are inferred from these boundaries, not surveyed.</p>`;
+    $('info').hidden = false;
+  }
+
+  function showFurniture(kind, r) {
+    const info = {
+      pole: () => ['Power pole · LiDAR 2019', `Pole, about ${r[3].toFixed(1)} m tall`,
+        `<dt>Street light</dt><dd>${r[4] ? 'assumed (not in open data)' : 'none modelled'}</dd>`,
+        'Pole position and height detected from power-line returns in the 2019 LiDAR. Street-light positions are not published openly here; lights are placed on street-side poles about 30 m apart.'],
+      signal: () => ['Traffic signals · OpenStreetMap', 'Traffic signal', `<dt>OSM node</dt><dd>${osmNode(r[4])}</dd>`,
+        'Signal location from OpenStreetMap; poles are placed either side of the road.'],
+      give_way: () => ['Sign · OpenStreetMap', 'Give way sign', `<dt>OSM node</dt><dd>${osmNode(r[5])}</dd>`, ''],
+      stop: () => ['Sign · OpenStreetMap', 'Stop sign', `<dt>OSM node</dt><dd>${osmNode(r[5])}</dd>`, ''],
+      bus_stop: () => ['Bus stop · OpenStreetMap', r[5] || 'Bus stop', `<dt>OSM node</dt><dd>${osmNode(r[4])}</dd>`, ''],
+      bench: () => ['Bench · OpenStreetMap', 'Bench', `<dt>OSM node</dt><dd>${osmNode(r[4])}</dd>`, ''],
+      name_sign: () => ['Street sign', r.blades.map((b) => b[0]).join(' / '), '',
+        'Street-name sign generated at an intersection of named OpenStreetMap streets.'],
+    }[kind]?.();
+    if (!info) return;
+    const [k, title, rows, note] = info;
+    $('info-body').innerHTML = `<div class="kind">${esc(k)}</div><h3>${esc(title)}</h3>
+      ${rows ? `<dl>${rows}</dl>` : ''}${note ? `<p class="note">${esc(note)}</p>` : ''}`;
+    $('info').hidden = false;
+  }
+
+  function osmNode(id) {
+    return `<a href="https://www.openstreetmap.org/node/${id}" target="_blank" rel="noopener">${id}</a>`;
   }
 
   function showTree(t) {
@@ -591,14 +640,14 @@ async function main() {
 
   // ---------------------------------------------------------------- about dialog
   $('about-body').innerHTML = `
-    <p>${esc(meta.title)} — a ${2 * H / 1000} km × ${2 * H / 1000} km open-data model centred on Yuruga Street
-    (${meta.anchor.lat.toFixed(5)}°, ${meta.anchor.lon.toFixed(5)}°; ${esc(meta.crs_name)}). The dashed outline
-    marks everything within ${meta.focus_buffer_m} m of the street.</p>
+    <p>${esc(meta.title)}: a ${2 * H / 1000} km × ${2 * H / 1000} km open-data model centred on
+    ${Math.abs(meta.anchor.lat).toFixed(5)}°S ${meta.anchor.lon.toFixed(5)}°E (${esc(meta.crs_name)}).</p>
     <table><tr><th>Layer</th><th>Source</th><th>Licence</th></tr>
     ${meta.sources.map((s) => `<tr><td>${esc(s.layer)}</td><td>${esc(s.name)}<br><small>${esc(s.credit)}</small></td><td>${esc(s.licence)}</td></tr>`).join('')}
     </table>
     <p><b>${meta.counts.buildings}</b> buildings (${meta.counts.lidar_heights || 0} with LiDAR-measured heights,
     ${meta.counts.lidar_outlines || 0} outlined from LiDAR) · <b>${(meta.counts.trees || 0).toLocaleString()}</b> trees ·
+    <b>${(meta.counts.lots || 0).toLocaleString()}</b> land parcels · <b>${meta.counts.poles || 0}</b> poles ·
     <b>${meta.counts.roads}</b> road/path segments · <b>${meta.counts.terrain_triangles.toLocaleString()}</b> terrain
     triangles. Built ${esc(meta.built)}.</p>
     <p>Accuracy notes: terrain, building heights and trees come from the 2019 LiDAR survey (about 34 points/m²).
@@ -694,7 +743,7 @@ async function main() {
   }
 
   // Expose for debugging / research scripting in the console.
-  window.theGap = { THREE, scene, camera, renderer, meta, features, terrain, bindex, setMode, jumpTo, walk, xr, orbit, trees };
+  window.theGap = { THREE, scene, camera, renderer, meta, features, terrain, bindex, setMode, jumpTo, walk, xr, orbit, trees, street, lotIndex };
 }
 
 function makeSkirt(terrain, H) {
@@ -719,30 +768,6 @@ function makeSkirt(terrain, H) {
   g.setIndex(idx);
   g.computeVertexNormals();
   return new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0x6f5f4d, roughness: 1, side: THREE.DoubleSide }));
-}
-
-function makeStreetRibbon(street, terrain) {
-  // Thin amber band down the centre of Yuruga Street.
-  const pts = [];
-  for (let i = 0; i < street.length - 1; i++) {
-    const [ax, az] = street[i], [bx, bz] = street[i + 1];
-    const L = Math.hypot(bx - ax, bz - az), n = Math.max(1, Math.ceil(L));
-    for (let k = 0; k < n; k++) pts.push([ax + ((bx - ax) * k) / n, az + ((bz - az) * k) / n]);
-  }
-  pts.push(street[street.length - 1]);
-  const pos = [], idx = [], w = 0.6;
-  pts.forEach(([x, z], i) => {
-    const [x2, z2] = pts[Math.min(i + 1, pts.length - 1)], [x1, z1] = pts[Math.max(i - 1, 0)];
-    let dx = x2 - x1, dz = z2 - z1; const L = Math.hypot(dx, dz) || 1; dx /= L; dz /= L;
-    const nx = -dz * w, nz = dx * w;
-    pos.push(x + nx, terrain.heightAt(x + nx, z + nz) + 0.08, z + nz, x - nx, terrain.heightAt(x - nx, z - nz) + 0.08, z - nz);
-    if (i < pts.length - 1) { const a = i * 2; idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3); }
-  });
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  g.setIndex(idx);
-  return new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xf2a541, transparent: true, opacity: 0.85,
-    side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -10, depthWrite: false }));
 }
 
 function makeTrees(rows, lowSpec) {

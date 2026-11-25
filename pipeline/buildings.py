@@ -46,6 +46,7 @@ ROOF = {  # pitch (deg), max rise (m), min eave (m), default total height (m)
     "canopy": (8.0, 0.6, 2.2, 2.9),
 }
 WALL_SRGB = np.array([231, 226, 215]) / 255.0   # neutral warm white (not data-derived)
+DOOR_SRGB = [np.array(c) / 255.0 for c in ((92, 62, 44), (238, 236, 230), (60, 70, 66), (120, 84, 56))]
 POST_SRGB = np.array([200, 198, 192]) / 255.0
 ROOF_FALLBACK_SRGB = np.array([168, 164, 156]) / 255.0
 
@@ -258,10 +259,10 @@ def _height_info(b, kind, skel_h, lidar=None):
 
 class MeshBuilder:
     def __init__(self):
-        self.pos, self.nrm, self.col, self.fid, self.idx = [], [], [], [], []
+        self.pos, self.nrm, self.col, self.fid, self.idx, self.fac = [], [], [], [], [], []
         self.n = 0
 
-    def add(self, verts3, tris, colour_lin, fid, normal=None):
+    def add(self, verts3, tris, colour_lin, fid, normal=None, fac=None):
         """verts3: (k,3) in local (x, north, z_abs); tris: (t,3) indices into verts3."""
         verts3 = np.asarray(verts3, dtype=np.float64)
         tris = np.asarray(tris, dtype=np.int64).reshape(-1, 3)
@@ -288,6 +289,8 @@ class MeshBuilder:
         self.nrm.append(normal if normal.ndim == 2 else np.repeat(normal[None, :], len(verts3), axis=0))
         self.col.append(np.repeat(np.asarray(colour_lin)[None, :], len(verts3), axis=0))
         self.fid.append(np.full(len(verts3), fid, dtype=np.float32))
+        self.fac.append(np.asarray(fac, np.float32) if fac is not None
+                        else np.tile(np.array([0, 0, 0, -1], np.float32), (len(verts3), 1)))
         self.idx.append(tris + self.n)
         self.n += len(verts3)
 
@@ -296,7 +299,7 @@ class MeshBuilder:
             return None
         return dict(pos=np.concatenate(self.pos), nrm=np.concatenate(self.nrm),
                     col=np.concatenate(self.col), fid=np.concatenate(self.fid),
-                    idx=np.concatenate(self.idx))
+                    idx=np.concatenate(self.idx), fac=np.concatenate(self.fac))
 
 
 def _triangulate(poly):
@@ -328,7 +331,44 @@ def _halfplane_poly(n, d, R, centre):
 SOURCE_NAMES = {"osm": "OpenStreetMap", "ms": "Microsoft ML footprint", "lidar": "LiDAR 2019 outline"}
 
 
+def _road_lines():
+    local = Local.osm()
+    osm = json.loads((RAW / "osm" / "osm.json").read_text())
+    lines = []
+    for e in osm["elements"]:
+        t = e.get("tags", {})
+        if e["type"] == "way" and t.get("highway") in ("primary", "secondary", "tertiary", "residential",
+                                                       "unclassified", "living_street", "road"):
+            lines.append(shapely.LineString(local.ring([(p["lon"], p["lat"]) for p in e["geometry"]])))
+    return lines
+
+
+def _front_door(ring, tree, lines):
+    """(wall index, door centre) on the longest-enough wall facing the nearest street, or None."""
+    best = None
+    for i in range(len(ring) - 1):
+        a, b = np.asarray(ring[i]), np.asarray(ring[i + 1])
+        seg = np.linalg.norm(b - a)
+        if seg < 2.4:
+            continue
+        mid = (a + b) / 2
+        o = np.array([b[1] - a[1], -(b[0] - a[0])]) / seg            # outward normal
+        road = lines[tree.nearest(shapely.Point(*mid))]
+        q = np.array(road.interpolate(road.project(shapely.Point(*mid))).coords[0])
+        to_road = q - mid
+        dist = np.linalg.norm(to_road)
+        facing = float(o @ to_road / max(dist, 1e-9))
+        if facing < 0.3:
+            continue
+        score = dist - 6 * facing
+        if best is None or score < best[0]:
+            best = (score, i, mid)
+    return None if best is None else (best[1], best[2])
+
+
 def build(terrain, H, lidar=None):
+    road_lines = _road_lines()
+    road_tree = STRtree(road_lines)
     blds, addr_pts = load_footprints(Local.osm(), H, Local())
     if lidar is not None:
         inside = shapely.box(-H + 1, -H + 1, H - 1, H - 1)
@@ -465,6 +505,9 @@ def build(terrain, H, lidar=None):
                 _box(walls, px, pn, 0.06, gz0, eave_abs, post_lin, fid)
         else:
             wr = np.asarray(wall_poly.exterior.coords)
+            # windows only on homes and civic buildings tall enough to have them
+            win_eave = eave_abs - ground if kind in ("house", "civic") and P.area >= 35 and eave_abs - ground >= 2.3 else -1.0
+            door = _front_door(wr, road_tree, road_lines) if win_eave > 0 and P.area >= 45 else None
             for i in range(len(wr) - 1):
                 (x0, n0), (x1, n1) = wr[i], wr[i + 1]
                 seg = math.hypot(x1 - x0, n1 - n0)
@@ -484,10 +527,21 @@ def build(terrain, H, lidar=None):
                     v3 = np.concatenate([np.column_stack([pts2[keep], np.full(k, base)]),
                                          np.column_stack([pts2[keep], zt[keep]])])
                     tr = [[i, i + 1, k + i + 1] for i in range(k - 1)] + [[i, k + i + 1, k + i] for i in range(k - 1)]
-                    walls.add(v3, tr, wall_lin, fid, normal=out_n)
-                    continue
-                v3 = np.array([[x0, n0, base], [x1, n1, base], [x1, n1, wall_top], [x0, n0, wall_top]])
-                walls.add(v3, [[0, 1, 2], [0, 2, 3]], wall_lin, fid, normal=out_n)
+                    u = np.r_[t[keep], t[keep]] * seg
+                    walls.add(v3, tr, wall_lin, fid, normal=out_n,
+                              fac=np.column_stack([u, v3[:, 2] - ground, np.full(2 * k, seg), np.full(2 * k, win_eave)]))
+                else:
+                    v3 = np.array([[x0, n0, base], [x1, n1, base], [x1, n1, wall_top], [x0, n0, wall_top]])
+                    walls.add(v3, [[0, 1, 2], [0, 2, 3]], wall_lin, fid, normal=out_n,
+                              fac=np.column_stack([[0, seg, seg, 0], v3[:, 2] - ground, np.full(4, seg), np.full(4, win_eave)]))
+                if door is not None and door[0] == i:
+                    dm, o = door[1], out_n[:2]
+                    tdir = np.array([x1 - x0, n1 - n0]) / seg
+                    gz = float(terrain.height(*dm))
+                    da, db = dm - tdir * 0.48 + o * 0.03, dm + tdir * 0.48 + o * 0.03
+                    dv = np.array([[*da, gz - 0.1], [*db, gz - 0.1], [*db, gz + 2.1], [*da, gz + 2.1]])
+                    dcol = DOOR_SRGB[fid % len(DOOR_SRGB)]
+                    walls.add(dv, [[0, 1, 2], [0, 2, 3]], srgb_to_linear(dcol), fid, normal=out_n)
 
         stats[h["src"]] = stats.get(h["src"], 0) + 1
         feats.append({

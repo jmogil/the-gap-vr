@@ -1,7 +1,8 @@
 """Unpack the ELVIS LiDAR order, keep compressed LAZ copies, and rasterise the points.
 
 Usage:
-    python pipeline/prepare_lidar.py /path/to/DATA_<job>.zip
+    python pipeline/prepare_lidar.py /path/to/DATA_<job>.zip      # ELVIS package
+    python pipeline/prepare_lidar.py ~/Library/Caches/the-gap-vr/lidar   # or a folder of LAZ/LAS tiles
 
 The ELVIS package (Brisbane 2019 project, QLD Government, classified LAS in AHD) is
 a zip of per-tile zips. Each tile is streamed once:
@@ -11,7 +12,8 @@ a zip of per-tile zips. Each tile is streamed once:
         veg_max  highest vegetation return (classes 3-5)  -> tree canopy
         gnd_mean mean ground return (class 2)             -> alignment check vs the DTM
         n_bld, n_veg, n_gnd point counts
-Output: data/derived/lidar_grids_0.5m.npz + data/derived/lidar_meta.json (in the project).
+  * unclassified returns (class 1: power lines, poles, street lights) are kept as points
+Output: data/derived/lidar_grids_0.5m.npz, lidar_unclassified.npz, lidar_meta.json (in the project).
 """
 import json
 import os
@@ -62,6 +64,16 @@ def unpack(package: pathlib.Path, work: pathlib.Path):
                 yield out
 
 
+def sources(path: pathlib.Path, work: pathlib.Path):
+    """(file, is_temporary) for every point-cloud tile in a folder or ELVIS zip."""
+    if path.is_dir():
+        for f in sorted(list(path.glob("*.laz")) + list(path.glob("*.las"))):
+            yield f, False
+    else:
+        for f in unpack(path, work):
+            yield f, True
+
+
 def main():
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
@@ -77,12 +89,13 @@ def main():
     n_veg = np.zeros(shape, np.uint16)
     n_gnd = np.zeros(shape, np.uint16)
     class_hist = np.zeros(256, np.int64)
+    unclassified = []
     tiles, crs_seen = [], set()
     LIDAR_CACHE.mkdir(parents=True, exist_ok=True)
     DERIVED.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     with tempfile.TemporaryDirectory(dir=LIDAR_CACHE) as tmp:
-        for las_path in unpack(package, pathlib.Path(tmp)):
+        for las_path, temporary in sources(package, pathlib.Path(tmp)):
             with laspy.open(las_path) as reader:
                 hdr = reader.header
                 try:
@@ -100,7 +113,8 @@ def main():
                     ex, ey = t.transform(cx, cy)
                     dx, dy = ex - cx, ey - cy  # constant shift is exact to mm over a 1 km tile
                 laz_path = LIDAR_CACHE / (las_path.stem + ".laz")
-                writer = None if laz_path.exists() else laspy.open(laz_path, mode="w", header=hdr, do_compress=True)
+                writer = None if (not temporary or laz_path.exists()) else \
+                    laspy.open(laz_path, mode="w", header=hdr, do_compress=True)
                 npts = 0
                 for pts in reader.chunk_iterator(5_000_000):
                     npts += len(pts)
@@ -122,6 +136,8 @@ def main():
                         f = flat[mask]
                         np.maximum.at(grid.ravel(), f, z[mask])
                         np.add.at(cnt.ravel(), f, 1)
+                    u = ok & (cls == 1)
+                    unclassified.append(np.column_stack([x[u], y[u], z[u]]).astype(np.float32))
                     g = ok & (cls == 2)
                     np.add.at(gnd_sum.ravel(), flat[g], z[g])
                     np.add.at(n_gnd.ravel(), flat[g], 1)
@@ -132,7 +148,8 @@ def main():
                               "point_format": int(hdr.point_format.id), "las_version": str(hdr.version)})
                 print(f"  {las_path.name}: {npts / 1e6:.1f} M points, CRS {tiles[-1]['crs']}, "
                       f"shift ({dx:.2f}, {dy:.2f}) m  [{time.time() - t0:.0f}s]")
-            las_path.unlink()
+            if temporary:
+                las_path.unlink()
 
     gnd_mean = np.where(n_gnd > 0, gnd_sum / np.maximum(n_gnd, 1), np.nan).astype(np.float32)
     bld_max[~np.isfinite(bld_max)] = np.nan
@@ -141,6 +158,8 @@ def main():
     def q(a):  # centimetres AHD as uint16 (0 = no data) -> compact, lossless enough
         return np.where(np.isfinite(a), np.clip(np.round(a * 100), 1, 65535), 0).astype(np.uint16)
 
+    pts1 = np.concatenate(unclassified) if unclassified else np.zeros((0, 3), np.float32)
+    np.savez_compressed(DERIVED / "lidar_unclassified.npz", xyz=pts1)   # local x, north, z AHD
     np.savez_compressed(DERIVED / "lidar_grids_0.5m.npz", bld_max_cm=q(bld_max), veg_max_cm=q(veg_max),
                         gnd_mean_cm=q(gnd_mean), n_bld=n_bld, n_veg=n_veg, n_gnd=n_gnd)
     names = {0: "never classified", 1: "unclassified", 2: "ground", 3: "low vegetation", 4: "medium vegetation",
