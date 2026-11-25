@@ -3,7 +3,6 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { Sky } from 'three/addons/objects/Sky.js';
-import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
 import { TerrainHeights, BuildingIndex, toLonLat, toMGA } from './world.js';
 import { WalkControls } from './walk.js';
@@ -12,6 +11,7 @@ import { sunPosition, brisbaneDate, brisbaneToday } from './sun.js';
 import { Minimap } from './minimap.js';
 import { makeLabel } from './labels.js';
 import { buildStreetscape, buildLotLines, LotIndex, palingTexture, applyFacade } from './streetscape.js';
+import { makeTrees, makeWaterMaterial, skyEnvironment } from './nature.js';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
@@ -132,7 +132,18 @@ async function main() {
   roads.material = mats.roads;
   walls.material = mats.walls;
   applyFacade(mats.walls);                          // windows per storey + weatherboards
-  const kerbs = meshes.kerbs, fences = meshes.fences;
+  const kerbs = meshes.kerbs, fences = meshes.fences, water = meshes.water;
+  if (water) {
+    water.material = makeWaterMaterial();
+    water.receiveShadow = true;
+    water.renderOrder = 2;
+  }
+  const skyEnv = skyEnvironment(renderer, sky.material);   // creek reflections follow the sky
+  let envTimer = 0;
+  const refreshEnv = () => {
+    clearTimeout(envTimer);
+    envTimer = setTimeout(() => { if (water) { water.material.envMap = skyEnv(); water.material.needsUpdate = true; } }, 150);
+  };
   if (kerbs) {
     kerbs.material = new THREE.MeshStandardMaterial({ color: 0xbdb9b1, roughness: 0.9 });
     kerbs.receiveShadow = kerbs.castShadow = true;
@@ -254,14 +265,18 @@ async function main() {
       `alt ${Math.round(THREE.MathUtils.radToDeg(elevation))}°`;
   }
   $('sun-time').addEventListener('input', updateSun);
+  $('sun-time').addEventListener('input', refreshEnv);
+  $('sun-date').addEventListener('change', refreshEnv);
   $('sun-date').addEventListener('change', updateSun);
   $('sun-now').addEventListener('click', () => {
     const t = brisbaneToday();
     $('sun-date').value = t.iso;
     $('sun-time').value = Math.min(1200, Math.max(300, t.minutes));
     updateSun();
+    refreshEnv();
   });
   updateSun();
+  refreshEnv();
 
   // ---------------------------------------------------------------- modes
   function freeSpot(x, z) {
@@ -407,6 +422,7 @@ async function main() {
   lyr('lyr-buildings', (on) => { walls.visible = roofs.visible = on; clearSelection(); });
   lyr('lyr-roads', (on) => { roads.visible = on; if (kerbs) kerbs.visible = on; });
   lyr('lyr-fences', (on) => { if (fences) fences.visible = on; });
+  lyr('lyr-water', (on) => { if (water) water.visible = on; });
   lyr('lyr-furniture', (on) => { if (street) street.group.visible = on; });
   lyr('lyr-lots', (on) => { if (lotLines) lotLines.visible = on; });
   lyr('lyr-labels', () => syncModeUI());
@@ -449,6 +465,7 @@ async function main() {
     const targets = groundOnly ? [terrainMesh, roads] : [roofs, walls, roads, terrainMesh];
     if (withTrees && trees && trees.group.visible) targets.push(trees.crowns);
     if (withTrees && street && street.group.visible) targets.push(...street.pick);
+    if (withTrees && water && water.visible) targets.unshift(water);
     const hits = raycaster.intersectObjects(targets.filter((m) => m.visible), false);
     return hits[0] || null;
   }
@@ -485,7 +502,8 @@ async function main() {
       if (lot) showLot(lot);
       return;
     }
-    if (trees && hit.object === trees.crowns) { showTree(treeData.trees[hit.instanceId]); return; }
+    if (trees && hit.object === trees.crowns) { showTree(treeData.trees[trees.treeIndex[hit.instanceId]]); return; }
+    if (water && hit.object === water) { showCreek(features.waterways[water.geometry.attributes._feature_id.getX(hit.face.a)]); return; }
     if (hit.object.userData?.kind) { showFurniture(hit.object.userData.kind, hit.object.userData.records[hit.instanceId]); return; }
     const fid = hit.object.geometry.attributes._feature_id.getX(hit.face.a);
     if (hit.object === roads) {
@@ -579,6 +597,20 @@ async function main() {
 
   function osmNode(id) {
     return `<a href="https://www.openstreetmap.org/node/${id}" target="_blank" rel="noopener">${id}</a>`;
+  }
+
+  function showCreek(w) {
+    $('info-body').innerHTML = `
+      <div class="kind">Creek · OpenStreetMap + LiDAR</div>
+      <h3>${esc(w.name || (w.kind === 'drain' ? 'Unnamed drain' : 'Unnamed creek'))}</h3>
+      <dl>
+        <dt>Type</dt><dd>${esc(cap(w.kind))}${w.intermittent ? ', intermittent (often dry)' : ''}</dd>
+        <dt>Water width</dt><dd>${w.width_m[0]}–${w.width_m[1]} m (modelled)</dd>
+        <dt>Length</dt><dd>${w.length_m} m in model</dd>
+        <dt>Source</dt><dd>${osmLink(w.osm_id)}</dd>
+      </dl>
+      <p class="note">Centreline from OpenStreetMap (also in Queensland's watercourse lines), snapped to the channel in the 2019 LiDAR. Width and water level are estimated from the terrain, not surveyed.</p>`;
+    $('info').hidden = false;
   }
 
   function showTree(t) {
@@ -712,6 +744,7 @@ async function main() {
       yaw = Math.atan2(-d.x, -d.z);
       updateShadowCamera(t.x, t.y, t.z, THREE.MathUtils.clamp(dist * 0.85, 160, 720));
     }
+    if (water && water.visible) water.material.normalMap.offset.x -= dt * 0.05;   // ripples drift downstream (~0.3 m/s)
     renderer.render(scene, camera);
 
     hudT += dt;
@@ -768,49 +801,4 @@ function makeSkirt(terrain, H) {
   g.setIndex(idx);
   g.computeVertexNormals();
   return new THREE.Mesh(g, new THREE.MeshStandardMaterial({ color: 0x6f5f4d, roughness: 1, side: THREE.DoubleSide }));
-}
-
-function makeTrees(rows, lowSpec) {
-  // One instanced crown + trunk per LiDAR treetop: rows = [x, y_ground, z, height, crown_radius, over_roof, hex].
-  let crownGeo = new THREE.IcosahedronGeometry(1, lowSpec ? 0 : 1);
-  crownGeo.deleteAttribute('normal');
-  crownGeo.deleteAttribute('uv');
-  crownGeo = mergeVertices(crownGeo);
-  const p = crownGeo.attributes.position;
-  for (let i = 0; i < p.count; i++) {        // gentle, deterministic lumpiness
-    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
-    const k = 1 + 0.1 * Math.sin(x * 5.1 + y * 3.7) * Math.cos(z * 4.3 - y * 2.1);
-    p.setXYZ(i, x * k, y * k, z * k);
-  }
-  crownGeo.computeVertexNormals();
-  const trunkGeo = new THREE.CylinderGeometry(1, 1, 1, 6, 1, true).translate(0, 0.5, 0);
-  const n = rows.length;
-  const crowns = new THREE.InstancedMesh(crownGeo, new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0 }), n);
-  const trunks = new THREE.InstancedMesh(trunkGeo, new THREE.MeshStandardMaterial({ color: 0x6b5a48, roughness: 1 }), n);
-  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), pos = new THREE.Vector3();
-  const up = new THREE.Vector3(0, 1, 0), col = new THREE.Color(), fallback = new THREE.Color(0x5d7a45), hsl = {};
-  rows.forEach(([x, y, z, h, r, overRoof, hex], i) => {
-    const base = h * (h > 8 ? 0.4 : 0.28);                  // crown starts higher on tall trees
-    const ry = Math.max((h - base) / 2, 0.6);
-    const rx = Math.max(r, 0.8);
-    q.setFromAxisAngle(up, (i * 2.399963) % (Math.PI * 2));
-    crowns.setMatrixAt(i, m.compose(pos.set(x, y + base + ry, z), q, s.set(rx, ry, rx)));
-    if (hex) {                                              // photo colour, lifted out of the shadows
-      col.set('#' + hex).getHSL(hsl);
-      col.setHSL(hsl.h, Math.min(hsl.s * 1.1, 0.55), THREE.MathUtils.clamp(hsl.l * 1.3, 0.2, 0.55));
-    } else col.copy(fallback);
-    crowns.setColorAt(i, col);
-    const tr = overRoof ? 0 : 0.1 + 0.012 * h;              // crowns over roofs: hide the trunk
-    trunks.setMatrixAt(i, m.compose(pos.set(x, y - 0.3, z), q, s.set(tr, overRoof ? 0 : base + ry * 0.6 + 0.3, tr)));
-  });
-  crowns.instanceMatrix.needsUpdate = trunks.instanceMatrix.needsUpdate = true;
-  crowns.instanceColor.needsUpdate = true;
-  crowns.computeBoundingSphere();
-  trunks.computeBoundingSphere();
-  crowns.castShadow = crowns.receiveShadow = true;
-  trunks.castShadow = trunks.receiveShadow = true;
-  const group = new THREE.Group();
-  group.name = 'trees';
-  group.add(crowns, trunks);
-  return { group, crowns, trunks };
 }
