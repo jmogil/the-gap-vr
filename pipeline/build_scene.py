@@ -20,6 +20,7 @@ from shapely.geometry import LineString  # noqa: E402
 import buildings  # noqa: E402
 import roads  # noqa: E402
 import streetscape  # noqa: E402
+import waterways  # noqa: E402
 from common import CONFIG, RAW, ROOT, WEB_DATA, write_json  # noqa: E402
 from glb import write_glb  # noqa: E402
 from lidar_features import LidarGrids  # noqa: E402
@@ -34,7 +35,7 @@ SOURCES = [
     {"layer": "Aerial imagery", "name": "Brisbane_LGA_2022_10cm_SISP orthophoto via LatestStateProgram_AllUsers",
      "licence": "CC BY-SA (per the service licence)", "credit": "© State of Queensland (Department of Natural Resources and Mines, "
      "Manufacturing and Regional and Rural Development)"},
-    {"layer": "Roads, OSM buildings, addresses", "name": "OpenStreetMap", "licence": "ODbL 1.0",
+    {"layer": "Roads, creeks, OSM buildings, addresses, street furniture", "name": "OpenStreetMap", "licence": "ODbL 1.0",
      "credit": "© OpenStreetMap contributors"},
     {"layer": "Gap-fill buildings + height estimates", "name": "Microsoft Global ML Building Footprints",
      "licence": "ODbL 1.0", "credit": "© Microsoft"},
@@ -148,6 +149,9 @@ def main():
 
     start = start_view(ways)
 
+    print("Waterways ...")
+    water_arr, wfeats = waterways.build(terrain, H)
+
     print("Streetscape ...")
     bpolys = [shapely.Polygon(b["footprint"]) for b in bfeats]
     lots, lot_lines, fence_arr = streetscape.lots_and_fences(terrain, H, bpolys)
@@ -184,6 +188,8 @@ def main():
                   extra={"_FACADE": walls["fac"]}),
         mesh_dict("building_roofs", roofs_, base_z, H, {"name": "roofs", "roughness": 0.7, "double_sided": True}),
     ]
+    if water_arr is not None:
+        meshes.append(mesh_dict("water", water_arr, base_z, H, {"name": "water", "roughness": 0.1}, uv="own"))
     if kerb_arr is not None:
         meshes.append(mesh_dict("kerbs", kerb_arr, base_z, H, {"name": "kerbs", "roughness": 0.9, "plain": True}, uv=False))
     if fence_arr is not None:
@@ -217,7 +223,7 @@ def main():
                    "terrain_triangles": int(len(terrain.triangles)), "trees": len(trees),
                    "lidar_heights": sum(1 for b in bfeats if b["height_source"].startswith("LiDAR")),
                    "lidar_outlines": sum(1 for b in bfeats if b["source"].startswith("LiDAR")),
-                   "lots": len(lots), "poles": len(poles), "wires": len(wires), "signals": len(signals),
+                   "lots": len(lots), "poles": len(poles), "waterways": len(wfeats), "wires": len(wires), "signals": len(signals),
                    "signs": len(signs), "bus_stops": len(stops), "name_signs": len(name_signs)},
         "alignment": {"osm_offset_m": CONFIG.get("osm_offset_m", {}).get("east_north", [0, 0]),
                       "note": CONFIG.get("osm_offset_m", {}).get("note", "")},
@@ -233,7 +239,8 @@ def main():
         b["centroid"] = [b["centroid"][0], -b["centroid"][1]]
     lab3 = [{"text": l["text"], "x": l["x"], "y": round(l["z"] - base_z, 2), "z": -l["n"],
              "angle": l["angle"]} for l in labels]
-    write_json(WEB_DATA / "features.json", {"buildings": bfeats, "roads": rfeats, "labels": lab3})
+    write_json(WEB_DATA / "features.json", {"buildings": bfeats, "roads": rfeats, "labels": lab3,
+                                            "waterways": wfeats})
     write_json(WEB_DATA / "lots.json", {"source": CADASTRE_SOURCE["name"], "lots": lots, "boundaries": lot_lines})
     write_json(WEB_DATA / "streetscape.json", street)
     write_json(ROOT / "export" / "streetscape.json", street, compact=False)
