@@ -122,8 +122,8 @@ async function main() {
     roads: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, metalness: 0,
       polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 }),
     walls: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0 }),
-    roofs: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.72, metalness: 0, side: THREE.DoubleSide }),
-    roofsPhoto: new THREE.MeshStandardMaterial({ map: ortho, roughness: 0.8, metalness: 0, side: THREE.DoubleSide }),
+    roofs: new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.72, metalness: 0, side: THREE.DoubleSide, flatShading: true }),
+    roofsPhoto: new THREE.MeshStandardMaterial({ map: ortho, roughness: 0.8, metalness: 0, side: THREE.DoubleSide, flatShading: true }),
     highlight: new THREE.MeshBasicMaterial({ color: 0x3fa7d6, transparent: true, opacity: 0.5, side: THREE.DoubleSide,
       polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -8, depthWrite: false }),
   };
@@ -511,15 +511,25 @@ async function main() {
         <dt>Height</dt><dd>${b.height_m.toFixed(1)} m to top · eave ${b.eave_m.toFixed(1)} m</dd>
         <dt>Height from</dt><dd><span class="swatch" style="background:${SRC_COLOURS[b.height_source]}"></span>${esc(b.height_source)}${measured && b.lidar_coverage ? ` · ${Math.round(b.lidar_coverage * 100)}% of roof seen` : ''}</dd>
         ${b.levels ? `<dt>Levels</dt><dd>${b.levels}</dd>` : ''}
-        <dt>Roof</dt><dd>${b.roof_colour ? `<span class="swatch" style="background:${b.roof_colour}"></span>` : ''}${b.roof}${b.roof_colour ? ', colour from 2022 aerial' : ''}</dd>
+        <dt>Roof</dt><dd>${esc(cap(b.roof))}${b.roof_pitch_deg ? `, ${b.roof_pitch_deg.toFixed(0)}° pitch` : ''}
+          <br><span style="color:var(--text-dim)">${esc(roofFrom(b))}</span></dd>
+        <dt>Roof colour</dt><dd>${b.roof_colour ? `<span class="swatch" style="background:${b.roof_colour}"></span>from 2022 aerial` : 'default'}</dd>
         <dt>Footprint</dt><dd>${b.footprint_m2.toFixed(0)} m²</dd>
         <dt>Ground</dt><dd>${b.ground_ahd.toFixed(1)} m AHD</dd>
         <dt>Outline</dt><dd>${outline}</dd>
       </dl>
       <p class="note">${measured
-        ? 'Eave and ridge heights measured from 2019 LiDAR; the roof form is a hip roof fitted between them.'
+        ? (b.roof_from === 'LiDAR surface'
+          ? 'Roof surface built directly from the 2019 LiDAR returns (simplified to about 15 cm).'
+          : 'Roof form and pitch fitted to the 2019 LiDAR returns.')
         : 'Height is an estimate (no LiDAR roof returns here). Roof form is modelled.'}</p>`;
     $('info').hidden = false;
+  }
+
+  function roofFrom(b) {
+    if (b.roof_from === 'LiDAR surface') return 'measured LiDAR surface';
+    if (b.roof_from === 'LiDAR fit') return `fitted to LiDAR (±${(b.roof_fit_rms_m * 100).toFixed(0)} cm)`;
+    return b.roof_from || 'modelled';
   }
 
   function showTree(t) {
@@ -592,8 +602,8 @@ async function main() {
     <b>${meta.counts.roads}</b> road/path segments · <b>${meta.counts.terrain_triangles.toLocaleString()}</b> terrain
     triangles. Built ${esc(meta.built)}.</p>
     <p>Accuracy notes: terrain, building heights and trees come from the 2019 LiDAR survey (about 34 points/m²).
-    Building outlines are OSM where mapped, otherwise Microsoft ML or traced from LiDAR. Roofs are hip roofs fitted
-    between the measured eave and ridge heights, not exact roof shapes. OSM here is shifted ${esc(
+    Building outlines are OSM where mapped, otherwise Microsoft ML or traced from LiDAR. Roofs come from the LiDAR:
+    simple roofs as fitted flat/hip/gable/skillion forms, complex roofs as the measured, plane-fitted roof surface. OSM here is shifted ${esc(
       (meta.alignment?.osm_offset_m || [0, 0]).map((v) => v.toFixed(2)).join(' m E, '))} m N to match the LiDAR.
     Road widths are typical values unless tagged. Colour buildings by height source to see what is measured.</p>`;
   $('about-link').addEventListener('click', (e) => { e.preventDefault(); $('about').showModal(); });
