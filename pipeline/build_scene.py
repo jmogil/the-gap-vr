@@ -60,9 +60,9 @@ def planar_uv(pos_local, H):
     return np.column_stack([(p[:, 0] + H) / (2 * H), (H - p[:, 1]) / (2 * H)]).astype(np.float32)
 
 
-def mesh_dict(name, arr, base_z, H, material):
+def mesh_dict(name, arr, base_z, H, material, uv=True):
     return {"name": name, "pos": to_three(arr["pos"], base_z), "nrm": nrm_three(arr["nrm"]),
-            "col": arr["col"], "uv": planar_uv(arr["pos"], H), "fid": arr["fid"],
+            "col": arr["col"], "uv": planar_uv(arr["pos"], H) if uv else None, "fid": arr["fid"],
             "idx": arr["idx"], "material": material}
 
 
@@ -134,7 +134,7 @@ def main():
     meshes = [
         terrain_mesh(terrain, base_z, H),
         mesh_dict("roads", road_arr, base_z, H, {"name": "roads", "roughness": 0.95}),
-        mesh_dict("building_walls", walls, base_z, H, {"name": "walls", "roughness": 0.85}),
+        mesh_dict("building_walls", walls, base_z, H, {"name": "walls", "roughness": 0.85}, uv=False),
         mesh_dict("building_roofs", roofs_, base_z, H, {"name": "roofs", "roughness": 0.7, "double_sided": True}),
     ]
 

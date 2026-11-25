@@ -24,6 +24,88 @@ META = ROOT / "data" / "derived" / "lidar_meta.json"
 RES = 0.5
 
 
+def _planarize(z, valid, res=RES, min_cells=12, max_dg=0.1, max_dz=0.08):
+    """Piecewise-planar roof heights: neighbouring cells with matching gradients and continuous
+    heights form a plane; each plane is least-squares fitted and every cell takes the height of
+    its own plane - or of the nearest large plane if its group is tiny (chimneys, vents, noise)."""
+    from scipy import sparse
+    from scipy.sparse.csgraph import connected_components
+
+    h, w = z.shape
+    g_rows, g_cols = np.gradient(z, res)
+    gx, gn = g_cols.ravel(), -g_rows.ravel()          # slope east / north (rows run south)
+    zr, vr = z.ravel(), valid.ravel()
+    idx = np.arange(h * w).reshape(h, w)
+    ea, eb = [], []
+    for a, b, dx, dn in ((idx[:, :-1].ravel(), idx[:, 1:].ravel(), res, 0.0),
+                         (idx[:-1, :].ravel(), idx[1:, :].ravel(), 0.0, -res)):
+        dg = np.hypot(gx[a] - gx[b], gn[a] - gn[b])
+        pred = zr[a] + 0.5 * ((gx[a] + gx[b]) * dx + (gn[a] + gn[b]) * dn)
+        ok = vr[a] & vr[b] & (dg < max_dg) & (np.abs(zr[b] - pred) < max_dz)
+        ea.append(a[ok])
+        eb.append(b[ok])
+    ea, eb = np.concatenate(ea), np.concatenate(eb)
+    graph = sparse.coo_matrix((np.ones(len(ea)), (ea, eb)), shape=(h * w, h * w))
+    _, lab = connected_components(graph, directed=False)
+    cols, rows = np.meshgrid(np.arange(w), np.arange(h))
+    X, Y = (cols * res).ravel(), (-rows * res).ravel()
+    counts = np.bincount(lab[vr], minlength=lab.max() + 1)
+    big = np.nonzero(counts >= min_cells)[0]
+    if len(big) == 0:
+        return z
+    coef = np.zeros((lab.max() + 1, 3))
+    for k in big:
+        m = vr & (lab == k)
+        A = np.column_stack([np.ones(m.sum()), X[m], Y[m]])
+        coef[k] = np.linalg.lstsq(A, zr[m], rcond=None)[0]
+    in_big = (vr & np.isin(lab, big)).reshape(h, w)
+    near = ndimage.distance_transform_edt(~in_big, return_distances=False, return_indices=True)
+    lab_full = lab.reshape(h, w)[tuple(near)].ravel()
+    c = coef[lab_full]
+    return (c[:, 0] + c[:, 1] * X + c[:, 2] * Y).reshape(h, w)
+
+
+class RoofSurface:
+    """Clipped roof mesh (verts (k,3) local x/north/z AHD, tris (t,3)) plus the full TIN for height queries."""
+
+    def __init__(self, verts, tris, tin_v, tin_t):
+        self.verts, self.tris = verts, tris
+        self._v, self._t = tin_v, tin_t
+        self._a, self._b, self._c = tin_v[tin_t[:, 0]], tin_v[tin_t[:, 1]], tin_v[tin_t[:, 2]]
+
+    def height_at(self, pts):
+        """Roof height (m AHD) at points (k, 2) from the TIN (nearest TIN vertex if outside)."""
+        a, b, c = self._a, self._b, self._c
+        v0x, v0y = b[:, 0] - a[:, 0], b[:, 1] - a[:, 1]
+        v1x, v1y = c[:, 0] - a[:, 0], c[:, 1] - a[:, 1]
+        den = v0x * v1y - v1x * v0y
+        out = np.empty(len(pts))
+        for i, (x, y) in enumerate(np.asarray(pts, dtype=np.float64)):
+            px, py = x - a[:, 0], y - a[:, 1]
+            u = (px * v1y - v1x * py) / den
+            w = (v0x * py - px * v0y) / den
+            hit = np.nonzero((u >= -1e-6) & (w >= -1e-6) & (u + w <= 1 + 1e-6))[0]
+            if len(hit):
+                j = hit[0]
+                out[i] = a[j, 2] + u[j] * (b[j, 2] - a[j, 2]) + w[j] * (c[j, 2] - a[j, 2])
+            else:
+                out[i] = self._v[np.argmin((self._v[:, 0] - x) ** 2 + (self._v[:, 1] - y) ** 2), 2]
+        return out
+
+    def pitch_deg(self):
+        """Area-weighted median pitch of the sloped roof triangles."""
+        p = self.verts[self.tris]
+        nrm = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+        area = 0.5 * np.linalg.norm(nrm, axis=1)
+        tilt = np.degrees(np.arccos(np.clip(np.abs(nrm[:, 2]) / np.maximum(2 * area, 1e-12), 0, 1)))
+        m = tilt > 3
+        if area[m].sum() < 0.2 * area.sum():
+            return 0.0
+        o = np.argsort(tilt[m])
+        cw = np.cumsum(area[m][o])
+        return float(tilt[m][o][np.searchsorted(cw, cw[-1] / 2)])
+
+
 class LidarGrids:
     @staticmethod
     def available():
@@ -87,6 +169,76 @@ class LidarGrids:
         he = he[np.isfinite(he)]
         eave = float(np.percentile(he, 30)) if len(he) >= 4 else float(np.percentile(h, 10))
         return {"total": total, "eave": min(eave, total), "coverage": round(coverage, 2)}
+
+    def roof_surface(self, poly: Polygon, max_error=0.06):
+        """The measured roof itself: an adaptive TIN of the building returns (spikes removed,
+        gaps filled from neighbours) clipped exactly to the footprint. Returns RoofSurface or None."""
+        import mapbox_earcut as earcut
+        from pydelatin import Delatin
+
+        win = self._window(poly.buffer(1.0))
+        r0, r1, c0, c1 = win
+        if r1 - r0 < 3 or c1 - c0 < 3:
+            return None
+        z = self.bld[r0:r1, c0:c1].astype(np.float64)
+        foot = self._mask(poly, win)
+        valid = np.isfinite(z) & self._mask(poly.buffer(0.5), win)
+        if valid.sum() < 8 or (valid & foot).sum() < 0.25 * max(int(foot.sum()), 1):
+            return None
+        idx = ndimage.distance_transform_edt(~valid, return_distances=False, return_indices=True)
+        zf = z[tuple(idx)]
+        med = ndimage.median_filter(zf, size=3)
+        zf = np.where(np.abs(zf - med) > 0.5, med, zf)          # chimneys, aerials, stray returns
+        zf = ndimage.gaussian_filter(zf, 0.6)                    # LiDAR noise
+        zf = _planarize(zf, valid)                               # snap cells to fitted roof planes
+        tin = Delatin(np.ascontiguousarray(zf, dtype=np.float32), max_error=max_error)
+        v = tin.vertices.astype(np.float64)                      # x = col, y = (rows-1) - row
+        rows = (zf.shape[0] - 1) - v[:, 1]
+        V = np.column_stack([-self.H + (c0 + v[:, 0] + 0.5) * RES, self.H - (r0 + rows + 0.5) * RES, v[:, 2]])
+        T = tin.triangles.astype(np.int64)
+        # plane z = A x + B n + C for every TIN triangle
+        p0, p1, p2 = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]
+        nz = np.cross(p1 - p0, p2 - p0)
+        good = np.abs(nz[:, 2]) > 1e-9
+        T, p0, nz = T[good], p0[good], nz[good]
+        A, B = -nz[:, 0] / nz[:, 2], -nz[:, 1] / nz[:, 2]
+        C = p0[:, 2] - A * p0[:, 0] - B * p0[:, 1]
+        xy = V[T][:, :, :2]
+        parts = shapely.intersection(shapely.polygons(np.concatenate([xy, xy[:, :1]], axis=1)), poly)
+        verts, tris, key = [], [], {}
+        for k, g in enumerate(parts):
+            for p in getattr(g, "geoms", [g]):
+                if p.geom_type != "Polygon" or p.is_empty or p.area < 1e-4:
+                    continue
+                rings = [np.asarray(p.exterior.coords)[:-1]] + [np.asarray(r.coords)[:-1] for r in p.interiors]
+                pv = np.concatenate(rings)
+                tr = earcut.triangulate_float64(pv, np.cumsum([len(r) for r in rings]).astype(np.uint32))
+                tr = tr.reshape(-1, 3)
+                ids = []
+                for x, nn in pv:
+                    kk = (round(x, 3), round(nn, 3))
+                    if kk not in key:
+                        key[kk] = len(verts)
+                        verts.append((x, nn, A[k] * x + B[k] * nn + C[k]))
+                    ids.append(key[kk])
+                ids = np.asarray(ids)
+                tris.extend(ids[tr].tolist())
+        if not tris:
+            return None
+        return RoofSurface(np.asarray(verts), np.asarray(tris, dtype=np.int64), V, T)
+
+    def roof_samples(self, poly: Polygon, shrink=0.25):
+        """Cell centres (local x, north) and roof heights (m AHD) of building returns inside a footprint."""
+        win = self._window(poly)
+        inner = poly.buffer(-shrink, join_style="mitre")
+        mask = self._mask(inner if not inner.is_empty else poly, win)
+        r0, r1, c0, c1 = win
+        z = self.bld[r0:r1, c0:c1]
+        ok = mask & np.isfinite(z)
+        rr, cc = np.nonzero(ok)
+        x = -self.H + (c0 + cc + 0.5) * RES
+        nn = self.H - (r0 + rr + 0.5) * RES
+        return np.column_stack([x, nn]), z[ok].astype(np.float64)
 
     def extra_buildings(self, existing, min_area=20.0, max_area=4000.0):
         """Roof-like clusters of building returns not covered by any known footprint."""

@@ -27,9 +27,11 @@ from shapely.geometry.polygon import orient
 from shapely.strtree import STRtree
 
 from common import CONFIG, RAW
-from roofs import _areal, skeleton_faces
+from roof_fit import fit_roof
+from roofs import RoofFrame, _areal
 
 G = 1e-3  # overlay grid (m)
+FIT_OK = 0.12  # m RMS: below this a clean fitted roof form is used, above it the measured surface
 
 KIND = {
     "house": "house", "detached": "house", "semidetached_house": "house", "residential": "house",
@@ -265,7 +267,14 @@ class MeshBuilder:
         tris = np.asarray(tris, dtype=np.int64).reshape(-1, 3)
         if len(tris) == 0:
             return
-        if normal is None:  # flat normal from first non-degenerate triangle
+        if isinstance(normal, str) and normal == "smooth":   # area-weighted per-vertex normals
+            p = verts3[tris]
+            fn = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+            normal = np.zeros_like(verts3)
+            for k in range(3):
+                np.add.at(normal, tris[:, k], fn)
+            normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
+        elif normal is None:  # flat normal from first non-degenerate triangle
             for t in tris:
                 a, b, c = verts3[t]
                 nv = np.cross(b - a, c - a)
@@ -274,8 +283,9 @@ class MeshBuilder:
                     break
             else:
                 return
+        normal = np.asarray(normal, dtype=np.float64)
         self.pos.append(verts3)
-        self.nrm.append(np.repeat(np.asarray(normal)[None, :], len(verts3), axis=0))
+        self.nrm.append(normal if normal.ndim == 2 else np.repeat(normal[None, :], len(verts3), axis=0))
         self.col.append(np.repeat(np.asarray(colour_lin)[None, :], len(verts3), axis=0))
         self.fid.append(np.full(len(verts3), fid, dtype=np.float32))
         self.idx.append(tris + self.n)
@@ -329,7 +339,7 @@ def build(terrain, H, lidar=None):
     ortho = OrthoSampler(H)
     walls, roofs = MeshBuilder(), MeshBuilder()
     feats = []
-    stats = {}
+    stats, roof_types = {}, {}
     for b in blds:
         P = orient(Polygon(b["poly"].exterior).simplify(0.15), 1.0)
         if not P.is_valid or P.area < 4:
@@ -337,7 +347,8 @@ def build(terrain, H, lidar=None):
         kind = KIND.get(b["tags"].get("building"), None)
         if kind is None:
             kind = "civic" if (P.area > 400 or b["tags"].get("building") not in (None, "yes")) else "house"
-        faces, skel_h = skeleton_faces(P)
+        frame = RoofFrame(P)
+        faces, skel_h = frame.faces(())
         if faces is None:
             faces, skel_h = [], 0.0
         fid = len(feats)
@@ -350,7 +361,33 @@ def build(terrain, H, lidar=None):
         h = _height_info(b, kind, skel_h, lstats)
         if not faces:
             h.update(slope=0.0, rise=0.0, eave=h["total"])
-        eave_abs = ground + h["eave"]
+        # Default roof: a hip between the eave and ridge heights (measured or estimated).
+        roof = dict(type="hip" if h["slope"] > 0 else "flat", gables=(), faces=faces, slope=h["slope"],
+                    cap=h["cap_d"] if h["slope"] > 0 else math.inf, eave_abs=ground + h["eave"],
+                    rms=None, fitted=False, flat_top=False)
+        if h["slope"] <= 0:
+            roof["eave_abs"] = ground + h["total"]
+        # LiDAR roofs: a clean fitted form (flat / hip / gable / skillion) where one explains the
+        # returns to within FIT_OK; otherwise the measured roof surface itself.
+        surface = None
+        if lstats is not None:
+            xy, zz = lidar.roof_samples(P)
+            if len(zz) >= 12:
+                fit = fit_roof(frame, xy, zz, P.area)
+                fit_faces = [] if fit["type"] == "flat" else frame.faces(fit["gables"])[0]
+                fit_ok = fit["eave"] >= ground + 1.2 and (fit["type"] == "flat" or fit_faces)
+                if not (fit_ok and fit["rms"] <= FIT_OK):
+                    surface = lidar.roof_surface(P)
+                if surface is None and fit_ok:
+                    roof = dict(type=fit["type"], gables=fit["gables"], faces=fit_faces, slope=fit["slope"],
+                                cap=fit["cap"], eave_abs=fit["eave"], rms=fit["rms"], fitted=True,
+                                flat_top=fit["flat_top"])
+                elif surface is not None:
+                    roof = dict(type="measured surface", gables=(), faces=[], slope=0.0, cap=math.inf,
+                                eave_abs=float(np.percentile(surface.height_at(ring), 20)), rms=fit["rms"],
+                                fitted=True, flat_top=False)
+                roof_types[roof["type"]] = roof_types.get(roof["type"], 0) + 1
+        eave_abs = roof["eave_abs"]
 
         rc = ortho.roof_colour(P)
         roof_lin = srgb_to_linear(ROOF_FALLBACK_SRGB if rc is None else np.clip(rc * 0.95, 0, 1))
@@ -359,13 +396,22 @@ def build(terrain, H, lidar=None):
 
         # --- roof -------------------------------------------------------------
         R = math.hypot(P.bounds[2] - P.bounds[0], P.bounds[3] - P.bounds[1]) + 1
+        slope, cap = roof["slope"], roof["cap"]
+        top_z = eave_abs + slope * cap if math.isfinite(cap) else None
+        zmax = eave_abs
         top_parts = []
-        roof_faces = faces if h["slope"] > 0 else [(P, None, None)]
+        roof_faces = roof["faces"] if slope > 0 else [(P, None, None)]
+        if surface is not None:          # measured roof: the clipped LiDAR TIN
+            roof_faces = []
+            roofs.add(surface.verts, _up_tris(surface.verts[:, :2], surface.tris), roof_lin, fid, normal="smooth")
+            zmax = float(surface.verts[:, 2].max())
         for poly, a, n in roof_faces:
             if a is None:
                 pieces = [(poly, None, None)]
+            elif top_z is None:
+                pieces = [(poly, a, n)]
             else:
-                sloped = _areal(shapely.intersection(poly, _halfplane_poly(n, h["cap_d"], R, a), grid_size=G))
+                sloped = _areal(shapely.intersection(poly, _halfplane_poly(n, cap, R, a), grid_size=G))
                 flat = _areal(shapely.difference(poly, sloped, grid_size=G))
                 pieces = [(p, a, n) for p in getattr(sloped, "geoms", [sloped]) if p.geom_type == "Polygon"]
                 top_parts += [p for p in getattr(flat, "geoms", [flat]) if p.geom_type == "Polygon" and p.area > 0.01]
@@ -375,11 +421,11 @@ def build(terrain, H, lidar=None):
                 v2, tris = _triangulate(p)
                 tris = _up_tris(v2, tris)
                 if aa is None:
-                    z = np.full(len(v2), eave_abs + h["rise"])
+                    z = np.full(len(v2), eave_abs)
                 else:
-                    z = eave_abs + h["slope"] * np.clip((v2 - aa) @ nn, 0, h["cap_d"])
-                v3 = np.column_stack([v2, z])
-                roofs.add(v3, tris, roof_lin, fid)
+                    z = eave_abs + slope * np.clip((v2[:, 0] - aa[0]) * nn[0] + (v2[:, 1] - aa[1]) * nn[1], 0, cap)
+                zmax = max(zmax, float(z.max()))
+                roofs.add(np.column_stack([v2, z]), tris, roof_lin, fid)
         if top_parts:
             top = _areal(shapely.union_all(top_parts, grid_size=G))
             for p in getattr(top, "geoms", [top]):
@@ -387,11 +433,21 @@ def build(terrain, H, lidar=None):
                     continue
                 v2, tris = _triangulate(p)
                 tris = _up_tris(v2, tris)
-                roofs.add(np.column_stack([v2, np.full(len(v2), eave_abs + h["rise"])]), tris, roof_lin, fid,
-                          normal=(0, 0, 1))
+                zmax = max(zmax, top_z)
+                roofs.add(np.column_stack([v2, np.full(len(v2), top_z)]), tris, roof_lin, fid, normal=(0, 0, 1))
+
+        def roof_z(pts2):
+            """Roof height above points (k, 2) - used to run walls up to the roof line."""
+            if surface is not None:
+                return surface.height_at(pts2) - 0.05     # tuck just under the measured roof
+            if slope <= 0:
+                return np.full(len(pts2), eave_abs)
+            D = frame.distance_field(pts2, roof["gables"])
+            return eave_abs + slope * np.minimum(np.where(np.isfinite(D), D, 0.0), cap)
 
         # --- walls (inset under the eaves) or posts for open canopies -----------
-        overhang = 0.45 if kind in ("house", "civic") and skel_h > 2.5 else 0.0
+        pitched = slope > 0 or surface is not None
+        overhang = 0.45 if kind in ("house", "civic") and skel_h > 2.5 and pitched else 0.0
         wall_poly = P
         if overhang:
             wp = P.buffer(-overhang, join_style="mitre", mitre_limit=5)
@@ -399,7 +455,7 @@ def build(terrain, H, lidar=None):
                 wall_poly = orient(wp, 1.0)
             else:
                 overhang = 0.0
-        wall_top = eave_abs + h["slope"] * min(overhang, h["cap_d"])
+        wall_top = eave_abs + slope * min(overhang, cap)
         if kind == "canopy":
             post_lin = srgb_to_linear(POST_SRGB)
             pb = P.buffer(-0.25, join_style="mitre")
@@ -411,11 +467,26 @@ def build(terrain, H, lidar=None):
             wr = np.asarray(wall_poly.exterior.coords)
             for i in range(len(wr) - 1):
                 (x0, n0), (x1, n1) = wr[i], wr[i + 1]
-                if math.hypot(x1 - x0, n1 - n0) < 1e-3:
+                seg = math.hypot(x1 - x0, n1 - n0)
+                if seg < 1e-3:
                     continue
-                v3 = np.array([[x0, n0, base], [x1, n1, base], [x1, n1, wall_top], [x0, n0, wall_top]])
                 out_n = np.array([n1 - n0, -(x1 - x0), 0.0])
                 out_n /= np.linalg.norm(out_n)
+                edge = frame.edge_for((x0, n0), (x1, n1)) if roof["gables"] else None
+                if surface is not None or (edge is not None and edge in roof["gables"]):
+                    # Gable, skillion high side or measured roof: the wall rises to meet the roof line.
+                    step = 0.25 if surface is not None else 0.05
+                    t = np.linspace(0.0, 1.0, max(2, int(seg / step) + 1))
+                    pts2 = np.column_stack([x0 + t * (x1 - x0), n0 + t * (n1 - n0)])
+                    zt = roof_z(pts2) - (0.02 if surface is not None else 0.0)
+                    keep = _simplify_profile(t * seg, zt, 0.04 if surface is not None else 0.002)
+                    k = len(keep)                      # one shared strip: bottom/top vertex pairs
+                    v3 = np.concatenate([np.column_stack([pts2[keep], np.full(k, base)]),
+                                         np.column_stack([pts2[keep], zt[keep]])])
+                    tr = [[i, i + 1, k + i + 1] for i in range(k - 1)] + [[i, k + i + 1, k + i] for i in range(k - 1)]
+                    walls.add(v3, tr, wall_lin, fid, normal=out_n)
+                    continue
+                v3 = np.array([[x0, n0, base], [x1, n1, base], [x1, n1, wall_top], [x0, n0, wall_top]])
                 walls.add(v3, [[0, 1, 2], [0, 2, 3]], wall_lin, fid, normal=out_n)
 
         stats[h["src"]] = stats.get(h["src"], 0) + 1
@@ -429,10 +500,13 @@ def build(terrain, H, lidar=None):
             "name": b["tags"].get("name"),
             "addresses": b["addresses"][:6],
             "levels": h["levels"],
-            "height_m": round(h["total"], 2),
-            "eave_m": round(h["eave"], 2),
+            "height_m": round(zmax - ground, 2),
+            "eave_m": round(eave_abs - ground, 2),
             "height_source": h["src"],
-            "roof": "hipped" if h["slope"] > 0 else "flat",
+            "roof": roof["type"] + (" with flat top" if roof["flat_top"] else ""),
+            "roof_pitch_deg": round(surface.pitch_deg() if surface is not None else math.degrees(math.atan(slope)), 1),
+            "roof_from": "LiDAR surface" if surface is not None else "LiDAR fit" if roof["fitted"] else ("modelled" if not lstats else "LiDAR heights, modelled hip"),
+            "roof_fit_rms_m": None if roof["rms"] is None else round(roof["rms"], 3),
             "roof_colour": None if rc is None else "#%02x%02x%02x" % tuple(int(v * 255) for v in rc),
             "footprint_m2": round(P.area, 1),
             "ground_ahd": round(ground, 2),
@@ -440,7 +514,25 @@ def build(terrain, H, lidar=None):
             "footprint": np.round(ring, 2).tolist(),
         })
     print(f"  buildings: {len(feats)}; height sources: {stats}")
+    print(f"  LiDAR-fitted roof forms: {roof_types}")
     return walls.arrays(), roofs.arrays(), feats
+
+
+def _simplify_profile(s, z, tol):
+    """Douglas-Peucker on a wall-top profile (s along the wall, z height): indices to keep."""
+    keep = np.zeros(len(s), bool)
+    keep[[0, -1]] = True
+    stack = [(0, len(s) - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        zi = z[i] + (z[j] - z[i]) * (s[i + 1:j] - s[i]) / max(s[j] - s[i], 1e-9)
+        k = int(np.argmax(np.abs(z[i + 1:j] - zi))) + i + 1
+        if abs(z[k] - (z[i] + (z[j] - z[i]) * (s[k] - s[i]) / max(s[j] - s[i], 1e-9))) > tol:
+            keep[k] = True
+            stack += [(i, k), (k, j)]
+    return np.nonzero(keep)[0]
 
 
 def _box(mb, x, n, hw, z0, z1, colour, fid):
